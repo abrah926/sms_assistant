@@ -1,0 +1,69 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Database
+*.sqlite3
+*.db
+
+# Logs
+*.log
+logs/
+log/
+
+# Temp files
+*.tmp
+.temp/
+tmp/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Local development settings
+local_settings.py
+
+# Test cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Prometheus metrics
+prometheus/
+prometheus_data/
+
+# Model cache
+.cache/
+.huggingface/ 
