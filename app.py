@@ -11,7 +11,8 @@ from models import Message, Base, MessageType
 from config import DATABASE_URL, OPENAI_API_KEY, ENABLE_METRICS
 from utils import (
     sanitize_phone_number, sanitize_message,
-    classify_message_type, MessageMetadata
+    classify_message_type, MessageMetadata,
+    get_customer_context, get_fallback_response
 )
 from monitoring import MetricsMiddleware, message_counter, response_time, error_counter
 import openai
@@ -134,13 +135,25 @@ async def generate_ai_response(message: str, history: list[Message], message_typ
 def process_message_sync(phone: str, content: str, db_url: str):
     """Synchronous message processing"""
     try:
-        # Create sync engine
         sync_url = db_url.replace('+asyncpg', '')
         engine = create_engine(sync_url)
         Session = sessionmaker(engine)
         
         with Session() as session:
             try:
+                # Check for recent duplicate messages
+                recent_message = session.query(Message)\
+                    .filter(
+                        Message.phone == phone,
+                        Message.content == content,
+                        Message.direction == "incoming",
+                        Message.timestamp >= datetime.now(timezone.utc) - timedelta(minutes=1)
+                    ).first()
+                
+                if recent_message:
+                    print("Duplicate message detected, skipping")
+                    return None
+
                 # Store incoming message
                 message = Message(
                     phone=phone,
@@ -151,10 +164,10 @@ def process_message_sync(phone: str, content: str, db_url: str):
                     meta_data={"processed": False}
                 )
                 session.add(message)
-                session.commit()
+                session.flush()  # Flush before generating response
 
                 # Use synchronous response generation
-                response = llm.generate_sync(content, [], None)  # New sync method
+                response = llm.generate_sync(content, [], None)
                 
                 # Store response
                 out_message = Message(
@@ -166,7 +179,7 @@ def process_message_sync(phone: str, content: str, db_url: str):
                     meta_data={"processed": True}
                 )
                 session.add(out_message)
-                session.commit()
+                session.commit()  # Single commit for both messages
                 return response
 
             except Exception as inner_e:
@@ -190,12 +203,7 @@ async def message_webhook(
     background_tasks: BackgroundTasks
 ):
     try:
-        # Add request debugging
-        print(f"Request method: {request.method}")
-        print(f"Request headers: {request.headers}")
-        
         data = await request.json()
-        print(f"Received data: {data}")  # Debug log
         
         if 'from_number' not in data or 'body' not in data:
             return JSONResponse(
@@ -206,22 +214,40 @@ async def message_webhook(
                 }
             )
         
-        # Add to background tasks
-        background_tasks.add_task(
-            process_message_sync,
-            data['from_number'],
-            data['body'],
-            DATABASE_URL
-        )
+        # Process message synchronously for immediate response
+        sync_url = DATABASE_URL.replace('+asyncpg', '')
+        engine = create_engine(sync_url)
+        Session = sessionmaker(engine)
         
-        return JSONResponse(content={
-            "status": "accepted",
-            "message": "Processing your request",
-            "received": {
-                "from": data['from_number'],
-                "body_length": len(data['body'])
-            }
-        })
+        with Session() as session:
+            # Fetch customer context
+            context = await get_customer_context(data['from_number'], session)
+            
+            # Generate response
+            response = llm.generate_sync(data['body'], context, None)
+            
+            # Use fallback if necessary
+            if not response or len(response.strip()) < 10:
+                response = get_fallback_response(data['body'])
+            
+            # Store response in background
+            background_tasks.add_task(
+                process_message_sync,
+                data['from_number'],
+                data['body'],
+                DATABASE_URL
+            )
+            
+            return JSONResponse(content={
+                "status": "success",
+                "message": "Request processed",
+                "response": response,
+                "received": {
+                    "from": data['from_number'],
+                    "body_length": len(data['body'])
+                }
+            })
+            
     except Exception as e:
         print(f"Webhook Error: {str(e)}")
         print(f"Error type: {type(e)}")
@@ -233,6 +259,20 @@ async def message_webhook(
                 "type": str(type(e))
             }
         )
+
+@app.get("/message/webhook")
+async def message_webhook_get():
+    """Handle GET requests with helpful message"""
+    return JSONResponse(
+        status_code=405,
+        content={
+            "status": "error",
+            "message": "This endpoint requires a POST request. Example usage:",
+            "example": {
+                "curl": 'curl -X POST http://localhost:8000/message/webhook -H "Content-Type: application/json" -d \'{"from_number": "+1234567890", "body": "What is the price of copper?"}\''
+            }
+        }
+    )
 
 @app.get("/metrics")
 async def get_metrics():

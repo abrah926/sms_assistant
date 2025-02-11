@@ -71,4 +71,14 @@ class MessageMetadata:
             'language': self.language,
             'urgency': self.urgency,
             'sentiment': self.sentiment
-        } 
+        }
+
+def get_fallback_response(prompt: str) -> str:
+    if "price" in prompt.lower() and "copper" in prompt.lower():
+        return "Copper is $8,500/ton with a 1 ton minimum. Would you like to place an order?"
+    elif "steel" in prompt.lower():
+        return "Steel is $800/ton with 5 ton minimum. How many tons do you need?"
+    elif "aluminum" in prompt.lower():
+        return "Aluminum is $2,400/ton with 2 ton minimum. Can I help you place an order?"
+    else:
+        return "How can I help you with your metal order today? We have steel, copper, and aluminum available."

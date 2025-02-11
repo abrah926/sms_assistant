@@ -107,4 +107,21 @@ async def process_order(
             "total_price": price_info["total_price"],
             "payment_method": f"{customer.payment_info['type']} ending in {customer.payment_info['card_ending']}"
         }
-    } 
+    }
+
+async def get_customer_context(phone: str, session: AsyncSession):
+    history = await session.execute("""
+        SELECT * FROM interactions 
+        WHERE phone = :phone 
+        ORDER BY timestamp DESC 
+        LIMIT 10
+    """, {'phone': phone})
+    
+    return format_context(history)
+
+def format_context(history):
+    # Format the history into a context string for the AI
+    context = []
+    for record in history:
+        context.append(f"{record['timestamp']}: {record['content']}")
+    return "\n".join(context)
