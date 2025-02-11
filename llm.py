@@ -166,7 +166,7 @@ Example Responses:
             with torch.no_grad():
                 outputs = self.model.generate(
                     inputs,
-                    max_new_tokens=100,  # Shorter responses
+                    max_new_tokens=100,
                     temperature=0.7,
                     top_p=0.95,
                     do_sample=True,
@@ -189,19 +189,32 @@ Example Responses:
                 response = re.sub(r'[^a-zA-Z0-9\s.,!?$%()-]', '', response)
                 response = ' '.join(response.split())
                 
-                # Validate response
+                # Default sales responses based on keywords
                 if not response or len(response.strip()) < 10:
-                    return get_fallback_response(prompt)
+                    if "steel" in prompt.lower():
+                        return "Steel is $800/ton with a 5-ton minimum. For large orders over 200 tons, you get a 5% discount. Ready to place an order?"
+                    elif "copper" in prompt.lower():
+                        return "Copper is currently $8,500/ton, minimum order 1 ton. Would you like to discuss bulk pricing?"
+                    elif "aluminum" in prompt.lower():
+                        return "Our aluminum is $2,400/ton starting at 2 tons. How many tons do you need?"
+                    else:
+                        return "We offer steel, copper, and aluminum at competitive prices. Which metal interests you today?"
                 
                 return response.strip()
                 
             except Exception as e:
                 print(f"Error cleaning response: {e}")
-                return get_fallback_response(prompt)
+                # Sales-focused fallbacks
+                if "price" in prompt.lower():
+                    return "Our current prices are very competitive - steel at $800/ton, copper at $8,500/ton, and aluminum at $2,400/ton. Which interests you?"
+                elif "discount" in prompt.lower():
+                    return "We offer great discounts on bulk orders: 5% off 200+ tons, 10% off 500+ tons. What volume are you looking for?"
+                else:
+                    return "Great to hear from you! We have steel, copper, and aluminum available. Which metal do you need?"
 
         except Exception as e:
             print(f"Error in generate_sync: {str(e)}")
-            return "I apologize, but I can help you with current metal pricing and orders. What metal are you interested in?"
+            return "Welcome! We have steel, copper, and aluminum available at competitive prices. Which metal interests you today?"
 
     def _clean_llm_response(self, response: str, prompt: str) -> str:
         """Clean LLM response to look more human"""
