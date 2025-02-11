@@ -87,6 +87,15 @@ async def startup_event():
         llm = MistralLLM()
         print("LLM initialized")
         
+        # Schedule training data collection
+        async def collect_training_data():
+            while True:
+                async with AsyncSessionLocal() as session:
+                    await schedule_training_collection(session)
+                await asyncio.sleep(3600)  # Run every hour
+        
+        asyncio.create_task(collect_training_data())
+        
     except Exception as e:
         print(f"Startup error: {str(e)}")
         raise
@@ -204,9 +213,12 @@ async def message_webhook(
     background_tasks: BackgroundTasks
 ):
     try:
+        print("Received webhook request")
         data = await request.json()
+        print(f"Request data: {data}")
         
         if 'from_number' not in data or 'body' not in data:
+            print("Missing required fields")
             return JSONResponse(
                 status_code=400,
                 content={
@@ -216,17 +228,21 @@ async def message_webhook(
             )
         
         async with AsyncSessionLocal() as session:
+            print(f"\n=== Processing new message ===")
+            print(f"From: {data['from_number']}")
+            print(f"Message: {data['body']}")
+            
             # Fetch customer context
             context = await get_customer_context(data['from_number'], session)
+            print(f"\nContext retrieved: {context}")
             
-            # Generate response
-            response = llm.generate_sync(data['body'], context, None)
-            
-            # Use fallback if necessary
-            if not response or len(response.strip()) < 10:
-                response = get_fallback_response(data['body'])
+            # Generate response with context
+            print("\nGenerating response...")
+            response = llm.generate_sync(data['body'], context, session)
+            print(f"Generated response: {response}")
             
             # Store messages
+            print("\nStoring messages...")
             message = Message(
                 phone=data['from_number'],
                 content=data['body'],
@@ -247,7 +263,9 @@ async def message_webhook(
             )
             session.add(out_message)
             
+            print("Committing to database...")
             await session.commit()
+            print("Database commit successful")
             
             return JSONResponse(content={
                 "status": "success",
@@ -260,8 +278,10 @@ async def message_webhook(
             })
             
     except Exception as e:
-        print(f"Webhook Error: {str(e)}")
+        print(f"\n=== Error in webhook ===")
         print(f"Error type: {type(e)}")
+        print(f"Error message: {str(e)}")
+        print(f"Error details: {getattr(e, 'detail', 'No details available')}")
         return JSONResponse(
             status_code=500,
             content={

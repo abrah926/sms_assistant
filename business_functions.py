@@ -111,23 +111,25 @@ async def process_order(
     }
 
 async def get_customer_context(phone: str, session: AsyncSession):
+    # Get last 5 relevant messages only
     query = text("""
         SELECT * FROM messages 
         WHERE phone = :phone 
+        AND direction = 'incoming'  -- Only user messages
         ORDER BY timestamp DESC 
-        LIMIT 10
+        LIMIT 5
     """)
     result = await session.execute(query, {"phone": phone})
-    rows = result.fetchall()  # Get all rows
+    rows = result.fetchall()
     
-    return format_context(rows)
-
-def format_context(history):
-    # Format the history into a context string for the AI
+    # Format context more clearly
     context = []
-    for record in history:
-        # Access columns by index or mapping
-        timestamp = record[4] if isinstance(record, tuple) else record.timestamp
-        content = record[2] if isinstance(record, tuple) else record.content
-        context.append(f"{timestamp}: {content}")
-    return "\n".join(context)
+    for record in rows:
+        # Format timestamp without milliseconds
+        timestamp = record[4].strftime("%Y-%m-%d %H:%M:%S") if record[4] else ""
+        content = record[2] if record[2] else ""
+        # Only add if content is meaningful
+        if content and not content.startswith('-') and not content.endswith('-'):
+            context.append(f"Customer ({timestamp}): {content}")
+    
+    return "\n".join(reversed(context))  # Chronological order

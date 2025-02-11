@@ -1,10 +1,11 @@
-from sqlalchemy import Column, Integer, String, DateTime, Text, Enum, Float, JSON
+from sqlalchemy import Column, Integer, String, DateTime, Text, Enum, Float, JSON, JSONB
 from sqlalchemy.ext.declarative import declarative_base
 import enum
 from datetime import datetime, timezone
 import json
 from typing import List, Dict
-from sqlalchemy.sql import select
+from sqlalchemy.sql import select, func
+from sqlalchemy import Index
 
 Base = declarative_base()
 
@@ -62,4 +63,18 @@ class Customer(Base):
     phone = Column(String, unique=True, nullable=False)
     name = Column(String)
     payment_info = Column(JSON, nullable=True)
-    created_at = Column(DateTime(timezone=True), default=datetime.now(timezone.utc)) 
+    created_at = Column(DateTime(timezone=True), default=datetime.now(timezone.utc))
+
+class TrainingExample(Base):
+    __tablename__ = "training_examples"
+    
+    id = Column(Integer, primary_key=True)
+    customer_message = Column(String, nullable=False)
+    agent_response = Column(String, nullable=False)
+    context = Column(String)  # Previous conversation context
+    metadata = Column(JSONB)  # Store things like product, intent, etc.
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    __table_args__ = (
+        Index('idx_training_created', created_at),
+    ) 

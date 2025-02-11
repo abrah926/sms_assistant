@@ -16,6 +16,17 @@ class MistralLLM:
             )
             print("Tokenizer initialized")
             
+            # Define custom chat template
+            self.tokenizer.chat_template = """{% for message in messages %}
+{% if message['role'] == 'system' %}{{ message['content'] }}
+{% elif message['role'] == 'user' %}
+Customer: {{ message['content'] }}
+{% elif message['role'] == 'assistant' %}
+Sales Agent: {{ message['content'] }}
+{% endif %}
+{% endfor %}
+"""
+            
             self.model = AutoModelForCausalLM.from_pretrained(
                 LLM_MODEL_PATH,
                 token=HUGGINGFACE_TOKEN,
@@ -23,7 +34,7 @@ class MistralLLM:
             ).to(DEVICE)
             print("Model initialized")
             
-            # Improved system prompt focused on sales
+            # Keep the original system prompt that was working
             self.system_prompt = """You are a professional sales assistant for a metal trading company. Your primary goal is to sell metal products and provide excellent customer service.
 
 Key Information:
@@ -134,28 +145,35 @@ Example Responses:
         clean = clean.replace("Assistant:", "").strip()
         return clean 
 
-    def generate_sync(self, prompt: str, history: List[Message], db=None) -> str:
+    def generate_sync(self, prompt: str, context: str, db=None) -> str:
         """Synchronous version of generate"""
         try:
+            print("\n=== LLM Generate Start ===")
+            print(f"Prompt: {prompt}")
+            print(f"Context: {context}")
+            
             # Format conversation with clear context
             messages = [{
                 "role": "system",
                 "content": self.system_prompt
             }]
             
-            # Add relevant history if available
-            if history:
-                for msg in history[-3:]:  # Only last 3 messages for context
-                    messages.append({
-                        "role": "user" if msg.direction == "incoming" else "assistant",
-                        "content": msg.content
-                    })
+            # Add context if available
+            if context:
+                messages.append({
+                    "role": "system",
+                    "content": f"Previous conversation context:\n{context}"
+                })
             
             # Add current prompt
             messages.append({
                 "role": "user",
                 "content": prompt
             })
+
+            # Debug print
+            print(f"Generating response for: {prompt}")
+            print(f"With context: {context}")
 
             # Generate response
             inputs = self.tokenizer.apply_chat_template(
@@ -189,7 +207,9 @@ Example Responses:
                 response = re.sub(r'[^a-zA-Z0-9\s.,!?$%()-]', '', response)
                 response = ' '.join(response.split())
                 
-                # Default sales responses based on keywords
+                print(f"Raw response: {response}")
+                
+                # Only use fallbacks if response is empty or too short
                 if not response or len(response.strip()) < 10:
                     if "steel" in prompt.lower():
                         return "Steel is $800/ton with a 5-ton minimum. For large orders over 200 tons, you get a 5% discount. Ready to place an order?"
@@ -200,21 +220,29 @@ Example Responses:
                     else:
                         return "We offer steel, copper, and aluminum at competitive prices. Which metal interests you today?"
                 
+                print(f"Raw LLM output: {response[:200]}...")
+                print("=== LLM Generate End ===\n")
                 return response.strip()
                 
             except Exception as e:
                 print(f"Error cleaning response: {e}")
-                # Sales-focused fallbacks
-                if "price" in prompt.lower():
-                    return "Our current prices are very competitive - steel at $800/ton, copper at $8,500/ton, and aluminum at $2,400/ton. Which interests you?"
-                elif "discount" in prompt.lower():
-                    return "We offer great discounts on bulk orders: 5% off 200+ tons, 10% off 500+ tons. What volume are you looking for?"
-                else:
-                    return "Great to hear from you! We have steel, copper, and aluminum available. Which metal do you need?"
+                return self._get_smart_fallback(prompt)
 
         except Exception as e:
-            print(f"Error in generate_sync: {str(e)}")
-            return "Welcome! We have steel, copper, and aluminum available at competitive prices. Which metal interests you today?"
+            print(f"LLM Error: {str(e)}")
+            return self._get_smart_fallback(prompt)
+
+    def _get_smart_fallback(self, prompt: str) -> str:
+        """Get context-aware fallback response"""
+        prompt_lower = prompt.lower()
+        if "price" in prompt_lower or "cost" in prompt_lower:
+            return "Our current prices are: steel at $800/ton, copper at $8,500/ton, and aluminum at $2,400/ton. Which interests you?"
+        elif "order" in prompt_lower or "buy" in prompt_lower:
+            return "I can help you place an order. We offer bulk discounts starting at 200 tons. What metal and quantity are you interested in?"
+        elif any(metal in prompt_lower for metal in ["steel", "copper", "aluminum"]):
+            return "I can provide pricing and availability for that metal. Would you like to know our current rates?"
+        else:
+            return "We specialize in steel, copper, and aluminum. What metal are you interested in today?"
 
     def _clean_llm_response(self, response: str, prompt: str) -> str:
         """Clean LLM response to look more human"""
