@@ -4,6 +4,7 @@ from typing import Optional
 import json
 from models import MessageType
 from datetime import datetime, timezone
+from business_functions import get_customer_context
 
 def sanitize_phone_number(phone: str) -> str:
     """Remove everything except digits and '+' from phone numbers"""

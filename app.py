@@ -12,8 +12,9 @@ from config import DATABASE_URL, OPENAI_API_KEY, ENABLE_METRICS
 from utils import (
     sanitize_phone_number, sanitize_message,
     classify_message_type, MessageMetadata,
-    get_customer_context, get_fallback_response
+    get_fallback_response
 )
+from business_functions import get_customer_context
 from monitoring import MetricsMiddleware, message_counter, response_time, error_counter
 import openai
 from fastapi.responses import Response, JSONResponse
@@ -189,13 +190,13 @@ def process_message_sync(phone: str, content: str, db_url: str):
         print(f"Processing error: {str(e)}")
         raise
 
-@app.get("/message/test")
-async def test_get():
-    """Simple test endpoint for GET requests"""
-    return JSONResponse(content={
-        "status": "success",
-        "message": "GET endpoint working. Use POST /message/webhook for actual messages"
-    })
+@app.get("/")
+async def read_root():
+    return {"message": "Welcome to the SMS Agent API"}
+
+@app.get("/favicon.ico")
+async def favicon():
+    return JSONResponse(content={"message": "Favicon not set"})
 
 @app.post("/message/webhook")
 async def message_webhook(
