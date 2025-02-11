@@ -5,8 +5,13 @@ from sqlalchemy.sql import text
 from datetime import datetime, timedelta
 import json
 import pandas as pd
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import csv
+import requests
+from bs4 import BeautifulSoup
+import re
+import asyncio
+import aiohttp
 
 async def store_training_example(
     session: AsyncSession,
@@ -378,3 +383,286 @@ def import_csv_conversations(file_path: str, mapping: Dict = None) -> List[Dict]
         print(f"Error reading CSV file: {e}")
     
     return conversations 
+
+class SalesDataCollector:
+    def __init__(self):
+        self.sources = {
+            "sales_hacker": "https://www.saleshacker.com/",
+            "hubspot_blog": "https://blog.hubspot.com/sales/",
+            "close_blog": "https://blog.close.com/"
+        }
+        
+        self.conversation_patterns = [
+            r"Customer:\s*(.*?)\s*Sales(?:person|rep):\s*(.*?)(?=Customer:|$)",
+            r"Prospect:\s*(.*?)\s*Rep:\s*(.*?)(?=Prospect:|$)",
+            r"Client:\s*(.*?)\s*Agent:\s*(.*?)(?=Client:|$)"
+        ]
+        
+        # Quality thresholds
+        self.quality_thresholds = {
+            "min_customer_length": 10,
+            "min_agent_length": 20,
+            "max_message_length": 500,
+            "min_relevance_score": 0.7
+        }
+        
+        # Keywords for relevance checking
+        self.relevant_keywords = {
+            "products": ["metal", "steel", "copper", "aluminum", "tonnes", "tons"],
+            "sales_terms": ["price", "cost", "order", "delivery", "quantity", "discount"],
+            "business_terms": ["quote", "purchase", "supply", "contract", "terms"]
+        }
+        
+        # Patterns for better conversation extraction
+        self.conversation_patterns.extend([
+            # Add more sophisticated patterns
+            r"(?:Customer|Client|Buyer)[\s>:\-]+([^>:\n]+?)[\s>:\-]+(?:Sales|Agent|Rep)[\s>:\-]+([^>:\n]+)",
+            r"(?:Q|Question)[\s>:\-]+([^>:\n]+?)[\s>:\-]+(?:A|Answer)[\s>:\-]+([^>:\n]+)",
+            r"(?:Inquiry|Request)[\s>:\-]+([^>:\n]+?)[\s>:\-]+(?:Response|Reply)[\s>:\-]+([^>:\n]+)"
+        ])
+
+    def calculate_relevance_score(self, text: str) -> float:
+        """Calculate relevance score based on keywords"""
+        text = text.lower()
+        score = 0
+        total_keywords = 0
+        
+        for category, keywords in self.relevant_keywords.items():
+            category_score = 0
+            for keyword in keywords:
+                if keyword in text:
+                    category_score += 1
+            score += category_score / len(keywords)
+            total_keywords += 1
+        
+        return score / total_keywords
+
+    def clean_and_validate_conversation(self, customer_msg: str, agent_msg: str) -> Tuple[str, str, bool]:
+        """Clean and validate conversation pairs"""
+        try:
+            # Basic cleaning
+            customer_msg = self.clean_conversation(customer_msg)
+            agent_msg = self.clean_conversation(agent_msg)
+            
+            # Length validation
+            if (len(customer_msg) < self.quality_thresholds["min_customer_length"] or
+                len(agent_msg) < self.quality_thresholds["min_agent_length"] or
+                len(customer_msg) > self.quality_thresholds["max_message_length"] or
+                len(agent_msg) > self.quality_thresholds["max_message_length"]):
+                return None, None, False
+            
+            # Calculate relevance scores
+            customer_relevance = self.calculate_relevance_score(customer_msg)
+            agent_relevance = self.calculate_relevance_score(agent_msg)
+            
+            # Check if meets quality threshold
+            if (customer_relevance + agent_relevance) / 2 < self.quality_thresholds["min_relevance_score"]:
+                return None, None, False
+            
+            # Additional cleaning
+            customer_msg = self.enhance_text_quality(customer_msg)
+            agent_msg = self.enhance_text_quality(agent_msg)
+            
+            return customer_msg, agent_msg, True
+            
+        except Exception as e:
+            print(f"Error in conversation validation: {e}")
+            return None, None, False
+
+    def enhance_text_quality(self, text: str) -> str:
+        """Enhance text quality with additional cleaning"""
+        # Remove URLs
+        text = re.sub(r'http\S+|www.\S+', '', text)
+        
+        # Standardize product units
+        text = re.sub(r'tonnes?', 'tons', text, flags=re.IGNORECASE)
+        text = re.sub(r'k(?:ilo)?g(?:ram)?s?', 'kg', text, flags=re.IGNORECASE)
+        
+        # Format prices consistently
+        text = re.sub(r'\$\s*(\d+)', r'$\1', text)
+        text = re.sub(r'(\d+)\s*dollars', r'$\1', text, flags=re.IGNORECASE)
+        
+        # Fix common typos
+        text = text.replace('aluminium', 'aluminum')
+        text = text.replace('tonnes', 'tons')
+        
+        # Ensure proper spacing after punctuation
+        text = re.sub(r'([.,!?])(\w)', r'\1 \2', text)
+        
+        # Remove multiple spaces
+        text = ' '.join(text.split())
+        
+        return text.strip()
+
+    async def extract_conversations_from_html(self, html_content: str) -> List[Dict]:
+        """Extract conversations from HTML content with better parsing"""
+        soup = BeautifulSoup(html_content, 'html.parser')
+        conversations = []
+        
+        # Remove irrelevant elements
+        for element in soup.find_all(['script', 'style', 'nav', 'footer']):
+            element.decompose()
+        
+        # Get main content
+        content = soup.get_text()
+        
+        # Extract conversations using patterns
+        for pattern in self.conversation_patterns:
+            matches = re.finditer(pattern, content, re.DOTALL | re.IGNORECASE)
+            for match in matches:
+                try:
+                    customer_msg, agent_msg, is_valid = self.clean_and_validate_conversation(
+                        match.group(1),
+                        match.group(2)
+                    )
+                    
+                    if is_valid:
+                        conversations.append({
+                            "customer_message": customer_msg,
+                            "agent_response": agent_msg,
+                            "quality_score": self.calculate_relevance_score(customer_msg + " " + agent_msg),
+                            "source": "web_scrape",
+                            "extraction_date": datetime.now().isoformat()
+                        })
+                except Exception:
+                    continue
+        
+        return conversations
+
+    async def gather_training_data(self, session: AsyncSession):
+        """Main function to gather and store training data"""
+        try:
+            # Collect from multiple sources
+            conversations = []
+            conversations.extend(await self.get_sales_hacker_data())
+            conversations.extend(await self.get_hubspot_examples())
+            conversations.extend(await self.get_suitecrm_samples())
+            
+            # Store collected conversations
+            stored_count = 0
+            for conv in conversations:
+                try:
+                    await store_training_example(
+                        session,
+                        conv["customer_message"],
+                        conv["agent_response"],
+                        metadata={
+                            "source": conv["source"],
+                            "category": conv["category"],
+                            "success_metrics": conv.get("success_metrics", {}),
+                            "industry": conv.get("industry"),
+                            "product_type": conv.get("product_type")
+                        }
+                    )
+                    stored_count += 1
+                except Exception as e:
+                    print(f"Error storing conversation: {e}")
+                    continue
+            
+            return stored_count
+            
+        except Exception as e:
+            print(f"Error gathering training data: {e}")
+            return 0
+
+    async def get_sales_hacker_data(self) -> List[Dict]:
+        """Collect sales conversation examples from Sales Hacker"""
+        conversations = []
+        async with aiohttp.ClientSession() as session:
+            try:
+                # Get article URLs
+                async with session.get("https://www.saleshacker.com/tag/sales-conversations/") as response:
+                    soup = BeautifulSoup(await response.text(), 'html.parser')
+                    articles = soup.find_all('article')
+                    
+                    for article in articles:
+                        try:
+                            article_url = article.find('a')['href']
+                            async with session.get(article_url) as article_response:
+                                content = await article_response.text()
+                                convs = self.extract_conversations(content)
+                                for customer_msg, agent_msg in convs:
+                                    conversations.append({
+                                        "customer_message": customer_msg,
+                                        "agent_response": agent_msg,
+                                        "source": "sales_hacker",
+                                        "category": "best_practices",
+                                        "success_metrics": {"published_example": True}
+                                    })
+                        except Exception as e:
+                            print(f"Error processing article: {e}")
+                            continue
+                            
+            except Exception as e:
+                print(f"Error fetching Sales Hacker data: {e}")
+        
+        return conversations
+
+    async def get_hubspot_examples(self) -> List[Dict]:
+        """Collect sales conversation examples from HubSpot's blog"""
+        conversations = []
+        async with aiohttp.ClientSession() as session:
+            try:
+                urls = [
+                    "https://blog.hubspot.com/sales/sales-conversation-starters",
+                    "https://blog.hubspot.com/sales/sales-scripts-examples"
+                ]
+                
+                for url in urls:
+                    async with session.get(url) as response:
+                        content = await response.text()
+                        convs = self.extract_conversations(content)
+                        for customer_msg, agent_msg in convs:
+                            conversations.append({
+                                "customer_message": customer_msg,
+                                "agent_response": agent_msg,
+                                "source": "hubspot",
+                                "category": "sales_scripts",
+                                "success_metrics": {"published_example": True}
+                            })
+                            
+            except Exception as e:
+                print(f"Error fetching HubSpot data: {e}")
+        
+        return conversations
+
+    def extract_conversations(self, content: str) -> List[Tuple[str, str]]:
+        """Extract conversation pairs from text content"""
+        conversations = []
+        
+        for pattern in self.conversation_patterns:
+            matches = re.finditer(pattern, content, re.DOTALL | re.IGNORECASE)
+            for match in matches:
+                try:
+                    customer_msg = match.group(1).strip()
+                    agent_msg = match.group(2).strip()
+                    if len(customer_msg) > 10 and len(agent_msg) > 10:
+                        conversations.append((customer_msg, agent_msg))
+                except Exception:
+                    continue
+        
+        return conversations
+
+    def clean_conversation(self, text: str) -> str:
+        """Clean and normalize conversation text"""
+        # Remove special characters
+        text = re.sub(r'[^\w\s.,!?$%()-]', '', text)
+        # Normalize whitespace
+        text = ' '.join(text.split())
+        return text.strip()
+
+# Add to INITIAL_TRAINING_DATA
+SALES_TECHNIQUE_DATA = [
+    # SPIN Selling examples
+    {
+        "customer_message": "We're having trouble with our current metal supplier's delivery times",
+        "agent_response": "That must be impacting your production schedule. How many delays have you experienced in the last month?",
+        "metadata": {"technique": "spin_selling", "stage": "problem"}
+    },
+    # Challenger Sale examples
+    {
+        "customer_message": "Your prices are higher than other suppliers",
+        "agent_response": "Did you know that our quality control process reduces waste by 15%? Most companies actually save money with us despite the higher initial cost. What's your current waste percentage?",
+        "metadata": {"technique": "challenger_sale", "stage": "reframe"}
+    }
+] 

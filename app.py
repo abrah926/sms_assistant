@@ -25,6 +25,8 @@ from llm import MistralLLM
 from fastapi.middleware.cors import CORSMiddleware
 from queue_handler import MessageQueue
 import asyncio
+from data_collection import SalesDataCollector, collect_successful_conversations
+from training import SalesModelTrainer
 
 # Database setup
 engine = create_async_engine(DATABASE_URL)
@@ -87,12 +89,26 @@ async def startup_event():
         llm = MistralLLM()
         print("LLM initialized")
         
-        # Schedule training data collection
+        # Initialize data collector with quality checks
+        collector = SalesDataCollector()
+        
+        # Schedule data collection
         async def collect_training_data():
             while True:
                 async with AsyncSessionLocal() as session:
-                    await schedule_training_collection(session)
-                await asyncio.sleep(3600)  # Run every hour
+                    print("\n=== Starting data collection ===")
+                    
+                    # Collect from external sources
+                    count = await collector.gather_training_data(session)
+                    print(f"Collected {count} new examples from external sources")
+                    
+                    # Collect internal conversations
+                    internal_count = await collect_successful_conversations(session)
+                    print(f"Collected {internal_count} internal examples")
+                    
+                    print("=== Data collection complete ===\n")
+                    
+                await asyncio.sleep(86400)  # Run daily
         
         asyncio.create_task(collect_training_data())
         
@@ -409,4 +425,40 @@ async def test_webhook(request: Request):
         return JSONResponse(
             status_code=500,
             content={"error": str(e)}
+        )
+
+@app.post("/train")
+async def train_model():
+    """Endpoint to trigger model training"""
+    try:
+        print("Starting model training...")
+        async with AsyncSessionLocal() as session:
+            trainer = SalesModelTrainer(llm.model, llm.tokenizer)
+            trained = await trainer.train(session)
+            
+            if trained:
+                print("Training complete. Updating model...")
+                # Update the global model
+                global llm
+                llm.model = trained.model
+                llm.model.eval()  # Set to evaluation mode
+                
+                return JSONResponse(content={
+                    "status": "success",
+                    "message": "Model training completed"
+                })
+            else:
+                return JSONResponse(content={
+                    "status": "error",
+                    "message": "No training data available"
+                })
+                
+    except Exception as e:
+        print(f"Training error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": str(e)
+            }
         )
