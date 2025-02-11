@@ -1,45 +1,37 @@
-import psycopg2
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from models import Message
 from config import DATABASE_URL
-import sys
-import os
 
-def get_db_params(database_url):
-    # Remove postgresql+asyncpg:// from the start
-    clean_url = database_url.replace('postgresql+asyncpg://', '')
-    # Split user:pass@host:port/dbname
-    auth, rest = clean_url.split('@')
-    user, password = auth.split(':')
-    host_port, dbname = rest.split('/')
-    
-    return {
-        'dbname': dbname,
-        'user': user,
-        'password': password,
-        'host': host_port.split(':')[0]
-    }
+# Convert async URL to sync URL
+SYNC_DB_URL = DATABASE_URL.replace('+asyncpg', '')
+
+def check_messages():
+    try:
+        print(f"Connecting to database: {SYNC_DB_URL}")
+        engine = create_engine(SYNC_DB_URL)
+        Session = sessionmaker(engine)
+        
+        with Session() as session:
+            print("\nFetching recent messages...")
+            messages = session.query(Message).order_by(Message.timestamp.desc()).limit(5).all()
+            
+            if not messages:
+                print("No messages found in database")
+                return
+            
+            print("\nMost recent messages:")
+            print("="*50)
+            for msg in messages:
+                print(f"Direction: {msg.direction}")
+                print(f"Phone: {msg.phone}")
+                print(f"Content: {msg.content}")
+                print(f"Timestamp: {msg.timestamp}")
+                print("-"*50)
+                
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        print(f"Error type: {type(e)}")
 
 if __name__ == "__main__":
-    db_params = get_db_params(DATABASE_URL)
-    
-    # Use psql if available, otherwise fallback to python shell
-    if os.system('which psql >/dev/null 2>&1') == 0:
-        os.system(f"psql -h {db_params['host']} -U {db_params['user']} {db_params['dbname']}")
-    else:
-        conn = psycopg2.connect(**db_params)
-        conn.autocommit = True
-        cursor = conn.cursor()
-        
-        print("Connected to database. Type SQL commands or 'exit' to quit.")
-        while True:
-            try:
-                command = input("sql> ")
-                if command.lower() in ('exit', 'quit', '\q'):
-                    break
-                if command.strip():
-                    cursor.execute(command)
-                    if cursor.description:
-                        results = cursor.fetchall()
-                        for row in results:
-                            print(row)
-            except Exception as e:
-                print(f"Error: {e}") 
+    check_messages() 

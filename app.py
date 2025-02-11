@@ -6,7 +6,7 @@ from pydantic import BaseModel, validator
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import select
+from sqlalchemy import select, create_engine
 from models import Message, Base, MessageType
 from config import DATABASE_URL, OPENAI_API_KEY, ENABLE_METRICS
 from utils import (
@@ -79,22 +79,11 @@ async def startup_event():
             await conn.run_sync(Base.metadata.create_all)
         print("Database initialized")
         
-        # Initialize OpenAI
-        print("Setting OpenAI key...")
-        openai.api_key = OPENAI_API_KEY
-        
         # Initialize LLM
         print("Initializing LLM...")
         global llm
         llm = MistralLLM()
         print("LLM initialized")
-        
-        # Initialize queue handler
-        global message_queue
-        message_queue = MessageQueue()
-        
-        # Start queue processor
-        asyncio.create_task(message_queue.process_messages(llm))
         
     except Exception as e:
         print(f"Startup error: {str(e)}")
@@ -144,51 +133,56 @@ async def generate_ai_response(message: str, history: list[Message], message_typ
 
 def process_message_sync(phone: str, content: str, db_url: str):
     """Synchronous message processing"""
-    print(f"Starting sync processing for {phone}")  # Debug log
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-    
     try:
         # Create sync engine
-        engine = create_engine(db_url)
+        sync_url = db_url.replace('+asyncpg', '')
+        engine = create_engine(sync_url)
         Session = sessionmaker(engine)
         
         with Session() as session:
-            print("Storing incoming message")  # Debug log
-            # Store message
-            message = Message(
-                phone=phone,
-                content=content,
-                direction="incoming",
-                timestamp=datetime.now(timezone.utc),
-                message_type=MessageType.GENERAL  # Add message type
-            )
-            session.add(message)
-            session.commit()
-            
-            print("Generating response")  # Debug log
-            # Generate response synchronously
-            response = llm._generate_response(content, [], 150)
-            print(f"Generated response: {response[:100]}...")  # Debug log
-            
-            print("Storing response message")  # Debug log
-            # Store response
-            out_message = Message(
-                phone=phone,
-                content=response,
-                direction="outgoing",
-                timestamp=datetime.now(timezone.utc),
-                message_type=MessageType.GENERAL  # Add message type
-            )
-            session.add(out_message)
-            session.commit()
-            
-            print(f"Processing completed for {phone}")  # Debug log
-            return response
+            try:
+                # Store incoming message
+                message = Message(
+                    phone=phone,
+                    content=content,
+                    direction="incoming",
+                    timestamp=datetime.now(timezone.utc),
+                    message_type=MessageType.GENERAL,
+                    meta_data={"processed": False}
+                )
+                session.add(message)
+                session.commit()
+
+                # Use synchronous response generation
+                response = llm.generate_sync(content, [], None)  # New sync method
+                
+                # Store response
+                out_message = Message(
+                    phone=phone,
+                    content=response,
+                    direction="outgoing",
+                    timestamp=datetime.now(timezone.utc),
+                    message_type=MessageType.GENERAL,
+                    meta_data={"processed": True}
+                )
+                session.add(out_message)
+                session.commit()
+                return response
+
+            except Exception as inner_e:
+                session.rollback()
+                raise
     except Exception as e:
-        print(f"Error in process_message_sync: {str(e)}")
-        print(f"Error type: {type(e)}")
+        print(f"Processing error: {str(e)}")
         raise
+
+@app.get("/message/test")
+async def test_get():
+    """Simple test endpoint for GET requests"""
+    return JSONResponse(content={
+        "status": "success",
+        "message": "GET endpoint working. Use POST /message/webhook for actual messages"
+    })
 
 @app.post("/message/webhook")
 async def message_webhook(
@@ -196,7 +190,21 @@ async def message_webhook(
     background_tasks: BackgroundTasks
 ):
     try:
+        # Add request debugging
+        print(f"Request method: {request.method}")
+        print(f"Request headers: {request.headers}")
+        
         data = await request.json()
+        print(f"Received data: {data}")  # Debug log
+        
+        if 'from_number' not in data or 'body' not in data:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "Missing required fields: from_number and body"
+                }
+            )
         
         # Add to background tasks
         background_tasks.add_task(
@@ -208,13 +216,22 @@ async def message_webhook(
         
         return JSONResponse(content={
             "status": "accepted",
-            "message": "Processing your request"
+            "message": "Processing your request",
+            "received": {
+                "from": data['from_number'],
+                "body_length": len(data['body'])
+            }
         })
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Webhook Error: {str(e)}")
+        print(f"Error type: {type(e)}")
         return JSONResponse(
             status_code=500,
-            content={"error": str(e)}
+            content={
+                "status": "error",
+                "error": str(e),
+                "type": str(type(e))
+            }
         )
 
 @app.get("/metrics")
