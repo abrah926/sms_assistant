@@ -25,6 +25,14 @@ async def store_training_example(
 ):
     """Store a new training example with deduplication"""
     try:
+        # Skip empty or invalid messages
+        if not customer_message or not agent_response:
+            return None
+            
+        # Skip very short messages
+        if len(customer_message) < 5 or len(agent_response) < 5:
+            return None
+            
         # Hash the message pair to check for duplicates quickly
         message_hash = hash(f"{customer_message}:{agent_response}")
         
@@ -34,6 +42,7 @@ async def store_training_example(
             
         # Check if we've seen this message pair before
         if message_hash in store_training_example.seen_messages:
+            # Don't print anything for duplicates
             return None
             
         # Add to seen messages
@@ -51,7 +60,8 @@ async def store_training_example(
         return example
         
     except Exception as e:
-        print(f"Error storing training example: {e}")
+        print(f"Error storing training example: {str(e)}")
+        print(f"Message pair: '{customer_message}' -> '{agent_response}'")
         await session.rollback()
         return None
 
@@ -1691,4 +1701,29 @@ class SalesDataCollector:
             "zinc": 100,
             "nickel": 25
         }
-        return min_orders.get(product.lower(), 50)  # Default 50 tons 
+        return min_orders.get(product.lower(), 50)  # Default 50 tons
+
+async def collect_training_data():
+    """Periodic data collection task"""
+    while True:
+        try:
+            async with AsyncSessionLocal() as session:
+                print("\n=== Starting data collection ===")
+                
+                # Collect from external sources
+                count = await collector.gather_training_data(session)
+                if count > 0:
+                    print(f"Collected {count} new examples from external sources")
+                
+                # Collect internal conversations
+                internal_count = await collect_successful_conversations(session)
+                if internal_count > 0:
+                    print(f"Collected {internal_count} internal examples")
+                
+                print("=== Data collection complete ===\n")
+                
+            await asyncio.sleep(86400)  # Run daily
+            
+        except Exception as e:
+            print(f"Error in data collection: {str(e)}")
+            await asyncio.sleep(300)  # Wait 5 minutes before retrying 

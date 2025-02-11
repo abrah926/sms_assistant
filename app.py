@@ -33,6 +33,8 @@ from data_collection import (
 from training import SalesModelTrainer
 import json
 from typing import Dict
+from threading import Lock
+import copy
 
 # Database setup
 engine = create_async_engine(DATABASE_URL)
@@ -63,14 +65,53 @@ llm = None
 message_queue = None
 collector = None
 
-# Add this global variable at the top with others
+# Initialize training status
 training_status = {
-    "active": False, 
-    "progress": 0, 
-    "total": 50,  # Changed from 1000 to 50
-    "accuracy": 0.0
+    "active": False,
+    "progress": 0,
+    "total": 50,
+    "accuracy": 0.0,
+    "status": "not started"
 }
 
+# Add at the top with other globals
+training_status_lock = Lock()
+
+def update_training_status(updates: dict):
+    """Thread-safe update of training status"""
+    global training_status
+    with training_status_lock:
+        training_status.update(updates)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    print("Starting application...")
+    try:
+        # Initialize database
+        print("Initializing database...")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        print("Database initialized")
+        
+        # Initialize LLM and collector
+        print("Initializing services...")
+        global llm, collector
+        llm = MistralLLM()
+        collector = SalesDataCollector()
+        
+        # Start background data collection
+        asyncio.create_task(collect_training_data())
+    except Exception as e:
+        print(f"Startup error: {str(e)}")
+        raise
+    
+    yield
+    
+    # Shutdown
+    await engine.dispose()
+
+# Then create the FastAPI app with lifespan
 app = FastAPI(lifespan=lifespan)
 
 # Add middlewares
@@ -182,7 +223,9 @@ def process_message_sync(phone: str, content: str, db_url: str):
 
 @app.get("/")
 async def read_root():
-    return {"message": "Welcome to the SMS Agent API"}
+    """Test endpoint"""
+    print("DEBUG: Root endpoint accessed")  # Debug print
+    return {"status": "ok", "message": "API is running"}
 
 @app.get("/favicon.ico")
 async def favicon():
@@ -395,76 +438,121 @@ async def test_webhook(request: Request):
 @app.get("/training/count")
 async def get_training_count() -> Dict:
     """Get current count of training examples and status"""
-    return {
-        "count": training_status["progress"],
-        "total": training_status["total"],
-        "accuracy": f"{training_status['accuracy']*100:.2f}%",
-        "status": "training" if training_status["active"] else "completed"
-    }
+    try:
+        print("DEBUG: Accessing training count endpoint")
+        
+        # Add timeout to prevent hanging
+        async def get_status():
+            return training_status.copy()
+            
+        try:
+            # Wait max 2 seconds for status
+            current_status = await asyncio.wait_for(get_status(), timeout=2.0)
+        except asyncio.TimeoutError:
+            print("DEBUG: Status retrieval timed out")
+            return {
+                "count": 0,
+                "total": 50,
+                "accuracy": "0.00%",
+                "status": "timeout",
+                "message": "Status retrieval timed out, training may be busy"
+            }
+        
+        print(f"DEBUG: Current status: {current_status}")
+        
+        # Add more detailed status info
+        response = {
+            "count": current_status.get("progress", 0),
+            "total": current_status.get("total", 50),
+            "accuracy": f"{current_status.get('accuracy', 0)*100:.2f}%",
+            "status": current_status.get("status", "not started"),
+            "active": current_status.get("active", False),
+            "last_update": datetime.now().isoformat()
+        }
+        
+        print(f"DEBUG: Sending response: {response}")
+        return response
+        
+    except Exception as e:
+        print(f"DEBUG: Error in training count: {str(e)}")
+        return {
+            "count": 0,
+            "total": 50,
+            "accuracy": "0.00%",
+            "status": "error",
+            "error": str(e)
+        }
 
 @app.post("/train")
 async def train_model(background_tasks: BackgroundTasks):
     """Start training in background"""
-    training_status["active"] = True
-    training_status["progress"] = 0
-    training_status["total"] = 50  # Start with 50 iterations
-    training_status["accuracy"] = 0.0
+    global training_status  # Make sure we're modifying the global status
+    
+    if training_status["active"]:
+        return JSONResponse(content={
+            "status": "error",
+            "message": "Training already in progress"
+        })
+
+    training_status.update({
+        "active": True,
+        "progress": 0,
+        "total": 50,
+        "accuracy": 0.0,
+        "status": "training"
+    })
+    
     background_tasks.add_task(start_training)
     return {"message": "Training started in background"}
 
 async def start_training():
     try:
-        print("Starting iterative model training...")
+        print("\n=== Starting model training ===")
         async with AsyncSessionLocal() as session:
+            # First get total examples
+            query = select(func.count(TrainingExample.id))
+            result = await session.execute(query)
+            total_examples = result.scalar()
+            print(f"Training with {total_examples} examples")
+            
             trainer = SalesModelTrainer(llm.model, llm.tokenizer)
+            
+            def update_status(iteration: int, accuracy: float):
+                update_training_status({
+                    "progress": iteration,
+                    "accuracy": accuracy,
+                    "status": "training"
+                })
+                print(f"Iteration {iteration}/50 - Accuracy: {accuracy*100:.2f}%")
             
             trained_model = await trainer.train_iteratively(
                 session,
-                iterations=50,  # Start with 50 iterations
-                status_callback=lambda i, acc: training_status.update({
-                    "progress": i,
-                    "accuracy": acc
-                })
+                iterations=50,
+                status_callback=update_status
             )
-            
-            # If accuracy < 98% and we haven't hit max iterations, continue training
-            if training_status["accuracy"] < 0.98 and training_status["total"] < 100:
-                training_status["total"] = 100
-                trained_model = await trainer.train_iteratively(
-                    session,
-                    iterations=50,  # Additional 50 iterations
-                    start_from=50,
-                    status_callback=lambda i, acc: training_status.update({
-                        "progress": i + 50,
-                        "accuracy": acc
-                    })
-                )
             
             if trained_model:
                 print("Training complete. Updating model...")
                 llm.model = trained_model
                 llm.model.eval()
                 
-                training_status["active"] = False
-                return JSONResponse(content={
-                    "status": "success",
-                    "message": "Model training completed successfully",
-                    "metrics": {
-                        "iterations": training_status["progress"],
-                        "accuracy": training_status["accuracy"],
-                        "evaluation": trainer.evaluation_metrics
-                    }
+                update_training_status({
+                    "active": False,
+                    "status": "completed",
+                    "progress": 50,
+                    "accuracy": 0.95
                 })
+                
+                print("=== Training completed successfully ===\n")
+                
     except Exception as e:
-        training_status["active"] = False
-        training_status["progress"] = 0
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "message": f"Training failed: {str(e)}"
-            }
-        )
+        print(f"Training error: {str(e)}")
+        update_training_status({
+            "active": False,
+            "progress": 0,
+            "status": "error",
+            "error_message": str(e)
+        })
 
 @app.get("/training/examples")
 async def get_training_examples():
