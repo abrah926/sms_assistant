@@ -215,12 +215,7 @@ async def message_webhook(
                 }
             )
         
-        # Process message synchronously for immediate response
-        sync_url = DATABASE_URL.replace('+asyncpg', '')
-        engine = create_engine(sync_url)
-        Session = sessionmaker(engine)
-        
-        with Session() as session:
+        async with AsyncSessionLocal() as session:
             # Fetch customer context
             context = await get_customer_context(data['from_number'], session)
             
@@ -231,13 +226,28 @@ async def message_webhook(
             if not response or len(response.strip()) < 10:
                 response = get_fallback_response(data['body'])
             
-            # Store response in background
-            background_tasks.add_task(
-                process_message_sync,
-                data['from_number'],
-                data['body'],
-                DATABASE_URL
+            # Store messages
+            message = Message(
+                phone=data['from_number'],
+                content=data['body'],
+                direction="incoming",
+                timestamp=datetime.now(timezone.utc),
+                message_type=MessageType.GENERAL,
+                meta_data={"processed": False}
             )
+            session.add(message)
+            
+            out_message = Message(
+                phone=data['from_number'],
+                content=response,
+                direction="outgoing",
+                timestamp=datetime.now(timezone.utc),
+                message_type=MessageType.GENERAL,
+                meta_data={"processed": True}
+            )
+            session.add(out_message)
+            
+            await session.commit()
             
             return JSONResponse(content={
                 "status": "success",

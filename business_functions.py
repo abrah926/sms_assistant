@@ -3,6 +3,7 @@ from decimal import Decimal
 from models import Product, Customer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.sql import text
 
 async def get_product_price(
     product_name: str,
@@ -110,18 +111,23 @@ async def process_order(
     }
 
 async def get_customer_context(phone: str, session: AsyncSession):
-    history = await session.execute("""
-        SELECT * FROM interactions 
+    query = text("""
+        SELECT * FROM messages 
         WHERE phone = :phone 
         ORDER BY timestamp DESC 
         LIMIT 10
-    """, {'phone': phone})
+    """)
+    result = await session.execute(query, {"phone": phone})
+    rows = result.fetchall()  # Get all rows
     
-    return format_context(history)
+    return format_context(rows)
 
 def format_context(history):
     # Format the history into a context string for the AI
     context = []
     for record in history:
-        context.append(f"{record['timestamp']}: {record['content']}")
+        # Access columns by index or mapping
+        timestamp = record[4] if isinstance(record, tuple) else record.timestamp
+        content = record[2] if isinstance(record, tuple) else record.content
+        context.append(f"{timestamp}: {content}")
     return "\n".join(context)

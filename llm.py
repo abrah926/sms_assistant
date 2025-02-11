@@ -23,20 +23,32 @@ class MistralLLM:
             ).to(DEVICE)
             print("Model initialized")
             
-            # Define improved system prompt
-            self.system_prompt = """You are a professional SMS sales assistant for a metal company. Be concise and natural in your responses.
+            # Improved system prompt focused on sales
+            self.system_prompt = """You are a professional sales assistant for a metal trading company. Your primary goal is to sell metal products and provide excellent customer service.
 
-Available Metals:
-- Steel: $800/ton (min: 5 tons)
-- Copper: $8,500/ton (min: 1 ton)
-- Aluminum: $2,400/ton (min: 2 tons)
+Key Information:
+- Products and Pricing:
+  * Copper: $8,500/ton (minimum: 1 ton)
+  * Steel: $800/ton (minimum: 5 tons)
+  * Aluminum: $2,400/ton (minimum: 2 tons)
 
 Guidelines:
-- Write like a human SMS, be brief and clear
-- Always mention minimum order quantities with prices
-- Be friendly but professional
-- No special characters or formatting
-- Keep responses under 160 characters when possible"""
+1. Always be sales-focused but professional
+2. Respond in a clear, concise manner
+3. Always mention pricing with minimum order quantities
+4. Offer bulk discounts for orders over:
+   - 200 tons: 5% discount
+   - 500 tons: 10% discount
+   - 1000 tons: 15% discount
+5. Use natural, human-like language
+6. Keep responses under 2-3 sentences
+7. Always encourage the sale
+
+Example Responses:
+- "Copper is $8,500 per ton with a 1 ton minimum. Would you like to place an order?"
+- "I can offer steel at $800/ton, minimum 5 tons. For larger orders over 200 tons, you'll get a 5% discount."
+- "Our aluminum is $2,400/ton with a 2-ton minimum order. How many tons would you like to purchase?"
+"""
             
         except Exception as e:
             print(f"Error initializing LLM: {str(e)}")
@@ -125,32 +137,45 @@ Guidelines:
     def generate_sync(self, prompt: str, history: List[Message], db=None) -> str:
         """Synchronous version of generate"""
         try:
-            # Prepare conversation with clear instructions
+            # Format conversation with clear context
             messages = [{
                 "role": "system",
                 "content": self.system_prompt
-            }, {
+            }]
+            
+            # Add relevant history if available
+            if history:
+                for msg in history[-3:]:  # Only last 3 messages for context
+                    messages.append({
+                        "role": "user" if msg.direction == "incoming" else "assistant",
+                        "content": msg.content
+                    })
+            
+            # Add current prompt
+            messages.append({
                 "role": "user",
                 "content": prompt
-            }]
+            })
 
             # Generate response
-            inputs = self.tokenizer.apply_chat_template(messages, return_tensors="pt").to(DEVICE)
+            inputs = self.tokenizer.apply_chat_template(
+                messages,
+                return_tensors="pt"
+            ).to(DEVICE)
             
             with torch.no_grad():
                 outputs = self.model.generate(
                     inputs,
-                    max_new_tokens=100,  # Shorter for SMS-like responses
+                    max_new_tokens=100,  # Shorter responses
                     temperature=0.7,
                     top_p=0.95,
                     do_sample=True,
                     pad_token_id=self.tokenizer.eos_token_id
                 )
             
-            # Decode and clean response
+            # Clean response
             response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             
-            # Extract and clean the actual response
             try:
                 # Remove system prompt and template markers
                 response = response.replace(self.system_prompt, "")
@@ -164,19 +189,19 @@ Guidelines:
                 response = re.sub(r'[^a-zA-Z0-9\s.,!?$%()-]', '', response)
                 response = ' '.join(response.split())
                 
-                # If response is invalid, use appropriate fallback
+                # Validate response
                 if not response or len(response.strip()) < 10:
-                    return "Copper is $8,500/ton with a 1 ton minimum. Would you like to place an order?"
+                    return get_fallback_response(prompt)
                 
                 return response.strip()
                 
             except Exception as e:
                 print(f"Error cleaning response: {e}")
-                return "Copper is $8,500/ton with a 1 ton minimum. Would you like to place an order?"
+                return get_fallback_response(prompt)
 
         except Exception as e:
             print(f"Error in generate_sync: {str(e)}")
-            return "Hi! I can help you with metal pricing and orders. What metal are you interested in?"
+            return "I apologize, but I can help you with current metal pricing and orders. What metal are you interested in?"
 
     def _clean_llm_response(self, response: str, prompt: str) -> str:
         """Clean LLM response to look more human"""
