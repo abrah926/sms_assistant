@@ -6,8 +6,8 @@ from pydantic import BaseModel, validator
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import select, create_engine
-from models import Message, Base, MessageType
+from sqlalchemy import select, create_engine, func
+from models import Message, Base, MessageType, TrainingExample
 from config import DATABASE_URL, OPENAI_API_KEY, ENABLE_METRICS
 from utils import (
     sanitize_phone_number, sanitize_message,
@@ -25,8 +25,14 @@ from llm import MistralLLM
 from fastapi.middleware.cors import CORSMiddleware
 from queue_handler import MessageQueue
 import asyncio
-from data_collection import SalesDataCollector, collect_successful_conversations
+from data_collection import (
+    SalesDataCollector, 
+    collect_successful_conversations,
+    store_training_example
+)
 from training import SalesModelTrainer
+import json
+from typing import Dict
 
 # Database setup
 engine = create_async_engine(DATABASE_URL)
@@ -52,8 +58,20 @@ class SMSMessage(BaseModel):
             raise ValueError('Message cannot be empty')
         return sanitize_message(v)
 
-# Create app first
-app = FastAPI()
+# Add with other global variables
+llm = None
+message_queue = None
+collector = None
+
+# Add this global variable at the top with others
+training_status = {
+    "active": False, 
+    "progress": 0, 
+    "total": 50,  # Changed from 1000 to 50
+    "accuracy": 0.0
+}
+
+app = FastAPI(lifespan=lifespan)
 
 # Add middlewares
 if ENABLE_METRICS:
@@ -66,59 +84,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Global LLM instance
-llm = None
-
-# Global queue handler
-message_queue = None
-
-@app.on_event("startup")
-async def startup_event():
-    print("Starting application...")
-    try:
-        # Initialize database
-        print("Initializing database...")
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        print("Database initialized")
-        
-        # Initialize LLM
-        print("Initializing LLM...")
-        global llm
-        llm = MistralLLM()
-        print("LLM initialized")
-        
-        # Initialize data collector with quality checks
-        collector = SalesDataCollector()
-        
-        # Schedule data collection
-        async def collect_training_data():
-            while True:
-                async with AsyncSessionLocal() as session:
-                    print("\n=== Starting data collection ===")
-                    
-                    # Collect from external sources
-                    count = await collector.gather_training_data(session)
-                    print(f"Collected {count} new examples from external sources")
-                    
-                    # Collect internal conversations
-                    internal_count = await collect_successful_conversations(session)
-                    print(f"Collected {internal_count} internal examples")
-                    
-                    print("=== Data collection complete ===\n")
-                    
-                await asyncio.sleep(86400)  # Run daily
-        
-        asyncio.create_task(collect_training_data())
-        
-    except Exception as e:
-        print(f"Startup error: {str(e)}")
-        raise
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    await engine.dispose()
 
 async def get_db():
     async with AsyncSessionLocal() as session:
@@ -427,38 +392,165 @@ async def test_webhook(request: Request):
             content={"error": str(e)}
         )
 
+@app.get("/training/count")
+async def get_training_count() -> Dict:
+    """Get current count of training examples and status"""
+    return {
+        "count": training_status["progress"],
+        "total": training_status["total"],
+        "accuracy": f"{training_status['accuracy']*100:.2f}%",
+        "status": "training" if training_status["active"] else "completed"
+    }
+
 @app.post("/train")
-async def train_model():
-    """Endpoint to trigger model training"""
+async def train_model(background_tasks: BackgroundTasks):
+    """Start training in background"""
+    training_status["active"] = True
+    training_status["progress"] = 0
+    training_status["total"] = 50  # Start with 50 iterations
+    training_status["accuracy"] = 0.0
+    background_tasks.add_task(start_training)
+    return {"message": "Training started in background"}
+
+async def start_training():
     try:
-        print("Starting model training...")
+        print("Starting iterative model training...")
         async with AsyncSessionLocal() as session:
             trainer = SalesModelTrainer(llm.model, llm.tokenizer)
-            trained = await trainer.train(session)
             
-            if trained:
+            trained_model = await trainer.train_iteratively(
+                session,
+                iterations=50,  # Start with 50 iterations
+                status_callback=lambda i, acc: training_status.update({
+                    "progress": i,
+                    "accuracy": acc
+                })
+            )
+            
+            # If accuracy < 98% and we haven't hit max iterations, continue training
+            if training_status["accuracy"] < 0.98 and training_status["total"] < 100:
+                training_status["total"] = 100
+                trained_model = await trainer.train_iteratively(
+                    session,
+                    iterations=50,  # Additional 50 iterations
+                    start_from=50,
+                    status_callback=lambda i, acc: training_status.update({
+                        "progress": i + 50,
+                        "accuracy": acc
+                    })
+                )
+            
+            if trained_model:
                 print("Training complete. Updating model...")
-                # Update the global model
-                global llm
-                llm.model = trained.model
-                llm.model.eval()  # Set to evaluation mode
+                llm.model = trained_model
+                llm.model.eval()
                 
+                training_status["active"] = False
                 return JSONResponse(content={
                     "status": "success",
-                    "message": "Model training completed"
+                    "message": "Model training completed successfully",
+                    "metrics": {
+                        "iterations": training_status["progress"],
+                        "accuracy": training_status["accuracy"],
+                        "evaluation": trainer.evaluation_metrics
+                    }
                 })
-            else:
-                return JSONResponse(content={
-                    "status": "error",
-                    "message": "No training data available"
-                })
-                
     except Exception as e:
-        print(f"Training error: {e}")
+        training_status["active"] = False
+        training_status["progress"] = 0
         return JSONResponse(
             status_code=500,
             content={
                 "status": "error",
-                "message": str(e)
+                "message": f"Training failed: {str(e)}"
             }
         )
+
+@app.get("/training/examples")
+async def get_training_examples():
+    """Get sample of training examples"""
+    async with AsyncSessionLocal() as session:
+        query = select(TrainingExample).order_by(TrainingExample.created_at.desc()).limit(5)
+        result = await session.execute(query)
+        examples = result.scalars().all()
+        
+        return {
+            "examples": [
+                {
+                    "customer_message": ex.customer_message,
+                    "agent_response": ex.agent_response,
+                    "metadata": ex.meta_info
+                }
+                for ex in examples
+            ]
+        }
+
+@app.get("/training/ab-results")
+async def get_ab_results():
+    """Get A/B test results for review"""
+    try:
+        with open('ab_test_results.json', 'r') as f:
+            results = json.load(f)
+            
+        return JSONResponse(content={
+            "status": "success",
+            "total_pairs": results['total_examples'],
+            "sample_pairs": results['ab_pairs'][:10],  # Show first 10 pairs
+            "message": "Use /training/ab-results/select to choose preferred responses"
+        })
+    except FileNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": "No A/B test results available"}
+        )
+
+@app.post("/training/ab-results/select")
+async def select_ab_responses(request: Request):
+    """Select preferred responses from A/B tests"""
+    data = await request.json()
+    selections = data.get('selections', [])
+    
+    async with AsyncSessionLocal() as session:
+        for selection in selections:
+            message_id = selection['message_id']
+            preferred_version = selection['preferred']  # 'a' or 'b'
+            
+            # Store the preferred response as training example
+            await store_training_example(
+                session,
+                customer_message=selection['customer_message'],
+                agent_response=selection[f'variation_{preferred_version}']['response'],
+                metadata={"source": "ab_test_selected", "version": preferred_version}
+            )
+    
+    return JSONResponse(content={
+        "status": "success",
+        "message": f"Stored {len(selections)} preferred responses"
+    })
+
+@app.get("/training/status")
+async def get_training_status():
+    """Get current training status"""
+    return JSONResponse(content={
+        "active": training_status["active"],
+        "progress": training_status["progress"],
+        "total_iterations": training_status["total"],
+        "percentage": f"{(training_status['progress'] / training_status['total']) * 100:.1f}%"
+    })
+
+async def collect_training_data():
+    """Periodic data collection task"""
+    while True:
+        async with AsyncSessionLocal() as session:
+            print("\n=== Starting data collection ===")
+            # Collect from external sources
+            count = await collector.gather_training_data(session)
+            print(f"Collected {count} new examples from external sources")
+            
+            # Collect internal conversations
+            internal_count = await collect_successful_conversations(session)
+            print(f"Collected {internal_count} internal examples")
+            
+            print("=== Data collection complete ===\n")
+            
+        await asyncio.sleep(86400)  # Run daily

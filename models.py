@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Integer, String, DateTime, Text, Enum, Float, JSON, JSONB
+from sqlalchemy import Column, Integer, String, DateTime, Text, Enum, Float, JSON
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
 import enum
 from datetime import datetime, timezone
@@ -72,7 +73,7 @@ class TrainingExample(Base):
     customer_message = Column(String, nullable=False)
     agent_response = Column(String, nullable=False)
     context = Column(String)  # Previous conversation context
-    metadata = Column(JSONB)  # Store things like product, intent, etc.
+    meta_info = Column(JSONB)  # Changed from metadata to meta_info
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     __table_args__ = (

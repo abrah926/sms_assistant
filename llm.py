@@ -5,126 +5,205 @@ from models import Message, MessageType
 from config import HUGGINGFACE_TOKEN, LLM_MODEL_PATH, DEVICE
 from sqlalchemy.ext.asyncio import AsyncSession
 import re
+import random
 
 class MistralLLM:
     def __init__(self):
-        print("Initializing LLM...")
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                LLM_MODEL_PATH,
-                token=HUGGINGFACE_TOKEN
+        print("Loading Mistral model and tokenizer...")
+        if not HUGGINGFACE_TOKEN:
+            raise EnvironmentError(
+                "HUGGINGFACE_TOKEN not found in environment variables. "
+                "Please add your token to .env file."
             )
-            print("Tokenizer initialized")
-            
-            # Define custom chat template
-            self.tokenizer.chat_template = """{% for message in messages %}
-{% if message['role'] == 'system' %}{{ message['content'] }}
-{% elif message['role'] == 'user' %}
-Customer: {{ message['content'] }}
-{% elif message['role'] == 'assistant' %}
-Sales Agent: {{ message['content'] }}
-{% endif %}
-{% endfor %}
+        
+        self.model = AutoModelForCausalLM.from_pretrained(
+            LLM_MODEL_PATH,
+            torch_dtype=torch.float16,
+            device_map=DEVICE,
+            trust_remote_code=True,
+            token=HUGGINGFACE_TOKEN
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            LLM_MODEL_PATH,
+            trust_remote_code=True,
+            token=HUGGINGFACE_TOKEN
+        )
+        
+        # Set model to evaluation mode
+        self.model.eval()
+        
+        # Enhanced system prompt with more detailed guidelines
+        self.system_prompt = """You are an expert metal sales agent with years of experience. Your role is to help customers purchase metals while maximizing sales opportunities.
+
+PRODUCT INFORMATION:
+1. Copper
+   - Base price: $8,500/ton
+   - Minimum order: 1 ton
+   - Purity: 99.9%
+   - Common uses: Electrical, construction
+
+2. Steel
+   - Base price: $800/ton
+   - Minimum order: 5 tons
+   - Grades available: Commercial, structural
+   - Common uses: Construction, manufacturing
+
+3. Aluminum
+   - Base price: $2,400/ton
+   - Minimum order: 2 tons
+   - Grades: Industrial, commercial
+   - Common uses: Manufacturing, aerospace
+
+BULK DISCOUNTS:
+- 200+ tons: 5% off
+- 500+ tons: 10% off
+- 1000+ tons: 15% off
+
+SALES GUIDELINES:
+1. Always acknowledge the customer's needs
+2. Quote specific prices and minimum orders
+3. Mention relevant bulk discounts
+4. Ask closing questions
+5. Keep responses concise (2-3 sentences)
+6. Use professional, confident language
+
+RESPONSE PATTERNS:
+- Price inquiry: State price, minimum order, then ask about quantity
+- Bulk order: Acknowledge order size, mention applicable discount, confirm order
+- Technical question: Provide specification, relate to value, move to quantity
+- Negotiation: Emphasize value, mention discounts, ask about volume
+
+Remember: Always move the conversation towards closing a sale.
 """
-            
-            self.model = AutoModelForCausalLM.from_pretrained(
-                LLM_MODEL_PATH,
-                token=HUGGINGFACE_TOKEN,
-                torch_dtype=torch.float16
-            ).to(DEVICE)
-            print("Model initialized")
-            
-            # Keep the original system prompt that was working
-            self.system_prompt = """You are a professional sales assistant for a metal trading company. Your primary goal is to sell metal products and provide excellent customer service.
 
-Key Information:
-- Products and Pricing:
-  * Copper: $8,500/ton (minimum: 1 ton)
-  * Steel: $800/ton (minimum: 5 tons)
-  * Aluminum: $2,400/ton (minimum: 2 tons)
+        # Response templates for common scenarios
+        self.response_templates = {
+            "price_inquiry": [
+                "{metal} is currently ${price}/ton with a {min_order} ton minimum. How many tons would you like to order?",
+                "Our {metal} is priced at ${price}/ton, starting at {min_order} tons. Shall we discuss bulk discounts?",
+                "The current rate for {metal} is ${price}/ton (minimum {min_order} tons). Would you like to place an order?"
+            ],
+            "bulk_order": [
+                "Excellent choice! For {quantity} tons of {metal}, you qualify for a {discount}% discount, bringing the price to ${final_price}/ton. Shall we proceed with the order?",
+                "Great volume! At {quantity} tons of {metal}, I can offer you a {discount}% discount (${final_price}/ton instead of ${price}/ton). Would you like to confirm this order?"
+            ],
+            "technical": [
+                "Our {metal} meets industry standards with {purity}% purity, perfect for {use}. At ${price}/ton, how many tons do you need?",
+                "The {metal} we supply is {purity}% pure, ideal for {use}. Would you like to discuss pricing for your required quantity?"
+            ]
+        }
 
-Guidelines:
-1. Always be sales-focused but professional
-2. Respond in a clear, concise manner
-3. Always mention pricing with minimum order quantities
-4. Offer bulk discounts for orders over:
-   - 200 tons: 5% discount
-   - 500 tons: 10% discount
-   - 1000 tons: 15% discount
-5. Use natural, human-like language
-6. Keep responses under 2-3 sentences
-7. Always encourage the sale
-
-Example Responses:
-- "Copper is $8,500 per ton with a 1 ton minimum. Would you like to place an order?"
-- "I can offer steel at $800/ton, minimum 5 tons. For larger orders over 200 tons, you'll get a 5% discount."
-- "Our aluminum is $2,400/ton with a 2-ton minimum order. How many tons would you like to purchase?"
-"""
-            
-        except Exception as e:
-            print(f"Error initializing LLM: {str(e)}")
-            raise
-
-    async def generate(self, prompt: str, history: List[Message], db: AsyncSession = None) -> str:
-        """Generate response with improved context handling"""
+    def _format_response(self, template_key: str, **kwargs) -> str:
+        """Format response using templates"""
+        templates = self.response_templates.get(template_key, [])
+        if not templates:
+            return None
+        
+        template = random.choice(templates)
         try:
-            # Format conversation
-            messages = [{
-                "role": "system",
-                "content": self.system_prompt
-            }]
-            
-            # Add history
-            for msg in history:
-                role = "user" if msg.direction == "incoming" else "assistant"
-                messages.append({
-                    "role": role,
-                    "content": msg.content
-                })
-            
-            # Add current prompt
-            messages.append({
-                "role": "user",
-                "content": prompt
-            })
+            return template.format(**kwargs)
+        except Exception as e:
+            print(f"Error formatting response: {e}")
+            return None
 
-            print(f"Generating response for prompt: {prompt}")
-            print(f"With {len(history)} messages in history")
-
+    async def generate(self, message: str, history: List[Message], db: AsyncSession) -> str:
+        try:
+            # Format conversation with system prompt and history
+            conversation = f"{self.system_prompt}\n\nCustomer: {message}\nAgent:"
+            
             # Generate response
-            inputs = self.tokenizer.apply_chat_template(
-                messages,
-                return_tensors="pt"
-            ).to(DEVICE)
-
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    inputs,
-                    max_new_tokens=200,  # Increased for better responses
-                    temperature=0.7,
-                    top_p=0.95,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id
-                )
+            inputs = self.tokenizer(conversation, return_tensors="pt").to(DEVICE)
+            outputs = self.model.generate(
+                **inputs,
+                max_length=512,
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id,
+                num_return_sequences=1
+            )
             
-            # Decode and clean response
             response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             
-            # Extract the actual response (after the last user message)
-            parts = response.split(prompt)
-            if len(parts) > 1:
-                response = parts[-1]
+            # Extract only the agent's response
+            response = response.split("Agent:")[-1].strip()
             
-            # Clean up
-            response = response.replace("Assistant:", "").strip()
+            # Try to use template if appropriate
+            if "price" in message.lower() or "cost" in message.lower():
+                metal = self._detect_metal(message)
+                if metal:
+                    template_response = self._format_response("price_inquiry",
+                        metal=metal,
+                        price=self._get_metal_price(metal),
+                        min_order=self._get_min_order(metal)
+                    )
+                    if template_response:
+                        return template_response
             
-            print(f"Generated response: {response[:100]}...")
             return response
-
+            
         except Exception as e:
-            print(f"Error in generate: {str(e)}")
-            print(f"Error type: {type(e)}")
-            return "I apologize, I'm having trouble processing your request. How can I help you today?"
+            print(f"Error generating response: {e}")
+            return "I apologize, but I'm having trouble processing your request. Could you please rephrase your question?"
+
+    def _detect_metal(self, message: str) -> str:
+        """Detect mentioned metal in message"""
+        message = message.lower()
+        if "copper" in message:
+            return "copper"
+        elif "steel" in message:
+            return "steel"
+        elif "aluminum" in message or "aluminium" in message:
+            return "aluminum"
+        return None
+
+    def _get_metal_price(self, metal: str) -> int:
+        """Get base price for metal"""
+        prices = {
+            "copper": 8500,
+            "steel": 800,
+            "aluminum": 2400
+        }
+        return prices.get(metal)
+
+    def _get_min_order(self, metal: str) -> int:
+        """Get minimum order for metal"""
+        min_orders = {
+            "copper": 1,
+            "steel": 5,
+            "aluminum": 2
+        }
+        return min_orders.get(metal)
+
+    def generate_sync(self, message: str, history: List[dict], db=None) -> str:
+        """Synchronous version of generate for background tasks"""
+        try:
+            # Format conversation with system prompt and history
+            conversation = f"{self.system_prompt}\n\nCustomer: {message}\nAgent:"
+            
+            # Generate response
+            inputs = self.tokenizer(conversation, return_tensors="pt").to(DEVICE)
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_length=512,
+                    temperature=0.7,
+                    top_p=0.9,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    num_return_sequences=1
+                )
+            
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # Extract only the agent's response
+            response = response.split("Agent:")[-1].strip()
+            
+            return response
+            
+        except Exception as e:
+            print(f"Error generating response: {e}")
+            return "I apologize, but I'm having trouble processing your request. Could you please rephrase your question?"
 
     def _format_history(self, history: List[Message]) -> str:
         formatted = []
@@ -282,3 +361,31 @@ Example Responses:
         except Exception as e:
             print(f"Error cleaning response: {e}")
             return "The price of copper is $8,500 per ton with a minimum order of 1 ton. Would you like to place an order?"
+
+    def clean_response(self, response: str) -> str:
+        """Clean model response"""
+        try:
+            # Remove system prompts and special tokens
+            response = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', response, flags=re.DOTALL)
+            response = re.sub(r'<\|.*?\|>', '', response)
+            
+            # Remove any gibberish patterns
+            response = re.sub(r'[\'\"]+[A-Z&]+[\'\"]+', '', response)
+            response = re.sub(r'[\'\"]<+[\'\"]', '', response)
+            
+            # Clean up the text
+            response = re.sub(r'[^a-zA-Z0-9\s.,!?$%()-]', '', response)
+            response = ' '.join(response.split())
+            
+            # If response is too short or gibberish, use template
+            if len(response.strip()) < 20 or not re.match(r'^[a-zA-Z0-9\s.,!?$%()-]+$', response):
+                return self._get_template_response()
+            
+            return response.strip()
+        except Exception as e:
+            print(f"Error cleaning response: {e}")
+            return self._get_template_response()
+
+    def _get_template_response(self) -> str:
+        """Get a template response for copper price inquiry"""
+        return "Copper is currently $8,500/ton with a minimum order of 1 ton. Would you like to place an order?"
