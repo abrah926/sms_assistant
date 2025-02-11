@@ -1,7 +1,7 @@
 import warnings
 warnings.filterwarnings("ignore", message="`torch.utils._pytree._register_pytree_node` is deprecated")
 
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
 from pydantic import BaseModel, validator
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -21,6 +21,8 @@ from contextlib import asynccontextmanager
 import re
 from llm import MistralLLM
 from fastapi.middleware.cors import CORSMiddleware
+from queue_handler import MessageQueue
+import asyncio
 
 # Database setup
 engine = create_async_engine(DATABASE_URL)
@@ -64,6 +66,9 @@ app.add_middleware(
 # Global LLM instance
 llm = None
 
+# Global queue handler
+message_queue = None
+
 @app.on_event("startup")
 async def startup_event():
     print("Starting application...")
@@ -84,6 +89,13 @@ async def startup_event():
         llm = MistralLLM()
         print("LLM initialized")
         
+        # Initialize queue handler
+        global message_queue
+        message_queue = MessageQueue()
+        
+        # Start queue processor
+        asyncio.create_task(message_queue.process_messages(llm))
+        
     except Exception as e:
         print(f"Startup error: {str(e)}")
         raise
@@ -97,11 +109,9 @@ async def get_db():
         yield session
 
 async def get_message_history(phone: str, db: AsyncSession, limit: int = 5):
-    """Get recent message history for context"""
     query = select(Message).where(Message.phone == phone).order_by(Message.timestamp.desc()).limit(limit)
     result = await db.execute(query)
-    messages = result.scalars().all()
-    return messages
+    return list(result.scalars().all())  # Convert to list immediately
 
 async def clean_ai_response(response: str) -> str:
     """Clean and humanize AI response"""
@@ -123,90 +133,89 @@ async def clean_ai_response(response: str) -> str:
     return response.strip()
 
 async def generate_ai_response(message: str, history: list[Message], message_type: MessageType, db: AsyncSession) -> str:
-    """Generate AI response using Mistral"""
+    """Simple wrapper around LLM generate"""
     try:
-        response = await llm.generate(
-            prompt=message,
-            history=history,
-            db=db
-        )
-        return await clean_ai_response(response)
+        if not llm:
+            return "System is initializing. Please try again in a moment."
+        return await llm.generate(message, history, db)
     except Exception as e:
-        print(f"LLM Error: {e}")
-        return f"I received your message. How can I help you today?"
+        print(f"Error in generate_ai_response: {e}")
+        return "I received your message. How can I help you today?"
+
+def process_message_sync(phone: str, content: str, db_url: str):
+    """Synchronous message processing"""
+    print(f"Starting sync processing for {phone}")  # Debug log
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    
+    try:
+        # Create sync engine
+        engine = create_engine(db_url)
+        Session = sessionmaker(engine)
+        
+        with Session() as session:
+            print("Storing incoming message")  # Debug log
+            # Store message
+            message = Message(
+                phone=phone,
+                content=content,
+                direction="incoming",
+                timestamp=datetime.now(timezone.utc),
+                message_type=MessageType.GENERAL  # Add message type
+            )
+            session.add(message)
+            session.commit()
+            
+            print("Generating response")  # Debug log
+            # Generate response synchronously
+            response = llm._generate_response(content, [], 150)
+            print(f"Generated response: {response[:100]}...")  # Debug log
+            
+            print("Storing response message")  # Debug log
+            # Store response
+            out_message = Message(
+                phone=phone,
+                content=response,
+                direction="outgoing",
+                timestamp=datetime.now(timezone.utc),
+                message_type=MessageType.GENERAL  # Add message type
+            )
+            session.add(out_message)
+            session.commit()
+            
+            print(f"Processing completed for {phone}")  # Debug log
+            return response
+    except Exception as e:
+        print(f"Error in process_message_sync: {str(e)}")
+        print(f"Error type: {type(e)}")
+        raise
 
 @app.post("/message/webhook")
-@response_time.time()
-async def handle_message(
-    message: SMSMessage,
-    request: Request,
-    db: AsyncSession = Depends(get_db)
+async def message_webhook(
+    request: Request, 
+    background_tasks: BackgroundTasks
 ):
-    # Add method validation
-    if request.method != "POST":
-        raise HTTPException(
-            status_code=405,
-            detail="Method not allowed. Use POST."
-        )
-
     try:
-        # Process and classify message
-        message_type = classify_message_type(message.body)
-        metadata = MessageMetadata(message.body)
+        data = await request.json()
         
-        print(f"Processing message: {message.body}")
-        print(f"Message type: {message_type}")
-        
-        # Store incoming message
-        new_message = Message(
-            phone=message.from_number,
-            content=message.body,
-            direction="incoming",
-            timestamp=datetime.now(timezone.utc),
-            message_type=message_type,
-            meta_data=metadata.to_json()
+        # Add to background tasks
+        background_tasks.add_task(
+            process_message_sync,
+            data['from_number'],
+            data['body'],
+            DATABASE_URL
         )
         
-        # Use add() instead of vars()
-        db.add(new_message)
-        await db.commit()
-        
-        message_counter.labels(direction='incoming', type=message_type.value).inc()
-        
-        # Get message history for context
-        history = await get_message_history(message.from_number, db)
-        print(f"Got message history: {len(history)} messages")
-        
-        # Generate AI response with context
-        try:
-            # Make sure to await the response
-            response = await generate_ai_response(message.body, history, message_type, db)
-            print(f"Generated response: {response}")
-        except Exception as e:
-            print(f"Error generating response: {str(e)}")
-            raise
-        
-        # Store outgoing message
-        out_message = Message(
-            phone=message.from_number,
-            content=response,
-            direction="outgoing",
-            timestamp=datetime.now(timezone.utc),
-            message_type=message_type
-        )
-        db.add(out_message)
-        await db.commit()
-        
-        message_counter.labels(direction='outgoing', type=message_type.value).inc()
-        
-        return {"status": "success", "response": response, "type": message_type.value}
-        
+        return JSONResponse(content={
+            "status": "accepted",
+            "message": "Processing your request"
+        })
     except Exception as e:
-        print(f"Error in handle_message: {str(e)}")
-        print(f"Error type: {type(e)}")
-        await db.rollback()
-        error_counter.labels(type=type(e).__name__).inc()
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
 
 @app.get("/metrics")
 async def get_metrics():
@@ -297,3 +306,19 @@ async def general_exception_handler(request: Request, exc: Exception):
             "detail": getattr(exc, "detail", str(exc))
         }
     )
+
+@app.post("/test/webhook")
+async def test_webhook(request: Request):
+    try:
+        data = await request.json()
+        return JSONResponse(content={
+            "status": "success",
+            "response": "This is a test response",
+            "echo": data
+        })
+    except Exception as e:
+        print(f"Test Error: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )

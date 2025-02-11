@@ -3,6 +3,7 @@ import re
 from typing import Optional
 import json
 from models import MessageType
+from datetime import datetime, timezone
 
 def sanitize_phone_number(phone: str) -> str:
     """Remove everything except digits and '+' from phone numbers"""
@@ -28,13 +29,46 @@ def classify_message_type(message: str) -> MessageType:
 
 class MessageMetadata:
     def __init__(self, message: str):
-        self.language = self.detect_language(message)
-        self.urgency = self.assess_urgency(message)
-        self.sentiment = self.analyze_sentiment(message)
+        self.message = message
+        self.timestamp = datetime.now(timezone.utc)
+        self.language = self._detect_language(message)
+        self.urgency = self._assess_urgency(message)
+        self.sentiment = self._analyze_sentiment(message)
     
-    def to_json(self) -> str:
-        return json.dumps({
+    def _detect_language(self, message: str) -> str:
+        """Simple language detection"""
+        # For now, default to English
+        return "en"
+    
+    def _assess_urgency(self, message: str) -> str:
+        """Simple urgency assessment"""
+        urgent_words = ['urgent', 'asap', 'emergency', 'immediately']
+        message = message.lower()
+        if any(word in message for word in urgent_words):
+            return "high"
+        return "normal"
+    
+    def _analyze_sentiment(self, message: str) -> str:
+        """Simple sentiment analysis"""
+        positive_words = ['good', 'great', 'excellent', 'thanks', 'please']
+        negative_words = ['bad', 'poor', 'issue', 'problem', 'wrong']
+        
+        message = message.lower()
+        pos_count = sum(1 for word in positive_words if word in message)
+        neg_count = sum(1 for word in negative_words if word in message)
+        
+        if pos_count > neg_count:
+            return "positive"
+        elif neg_count > pos_count:
+            return "negative"
+        return "neutral"
+    
+    def to_json(self) -> dict:
+        return {
+            'raw_message': self.message,
+            'timestamp': self.timestamp.isoformat(),
+            'length': len(self.message),
             'language': self.language,
             'urgency': self.urgency,
             'sentiment': self.sentiment
-        }) 
+        } 

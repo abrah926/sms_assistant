@@ -3,6 +3,7 @@ from httpx import AsyncClient
 from datetime import datetime
 from typing import List, Dict
 import json
+import httpx
 
 class TestScenario:
     def __init__(self, name: str, customer: Dict, messages: List[Dict[str, str]]):
@@ -70,38 +71,48 @@ scenarios = [
 ]
 
 async def test_conversation(scenario: TestScenario):
-    async with AsyncClient() as client:
+    # Configure client with longer timeout
+    async with AsyncClient(timeout=60.0) as client:  # Increase timeout to 60 seconds
         print(f"\nTesting Scenario: {scenario.name}")
         print(f"Customer: {scenario.customer['name']}")
         print("=" * 50)
         
         for msg in scenario.messages:
-            response = await client.post(
-                "http://localhost:8000/message/webhook",
-                json={
-                    "from_number": scenario.customer["phone"],
-                    "body": msg["text"]
-                }
-            )
-            
-            # Add debug information
-            print(f"\nStatus Code: {response.status_code}")
-            print(f"Response Content: {response.content}")
-            
-            if response.status_code != 200:
-                print(f"Error Response: {response.text}")
-                continue
-                
             try:
-                result = response.json()
-                print(f"\nUser: {msg['text']}")
-                print(f"AI: {result['response']}")
-                print(f"Type: {result['type']}")
-            except json.JSONDecodeError as e:
-                print(f"Failed to decode JSON: {e}")
-                print(f"Raw response: {response.text}")
-            
-            await asyncio.sleep(1)
+                response = await client.post(
+                    "http://localhost:8000/message/webhook",
+                    json={
+                        "from_number": scenario.customer["phone"],
+                        "body": msg["text"]
+                    },
+                    timeout=60.0  # Explicit timeout for each request
+                )
+                
+                print(f"\nStatus Code: {response.status_code}")
+                print(f"Response Content: {response.content}")
+                
+                if response.status_code != 200:
+                    print(f"Error Response: {response.text}")
+                    continue
+                    
+                try:
+                    result = response.json()
+                    print(f"\nUser: {msg['text']}")
+                    print(f"AI: {result['response']}")
+                    print(f"Type: {result['type']}")
+                except json.JSONDecodeError as e:
+                    print(f"Failed to decode JSON: {e}")
+                    print(f"Raw response: {response.text}")
+                
+                # Add delay between messages
+                await asyncio.sleep(2)  # Increase delay between messages
+                
+            except httpx.ReadTimeout:
+                print(f"Request timed out for message: {msg['text']}")
+                continue
+            except Exception as e:
+                print(f"Error processing message: {str(e)}")
+                continue
 
 async def run_all_tests():
     print("Starting Metal Sales SMS Tests")

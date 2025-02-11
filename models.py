@@ -2,6 +2,9 @@ from sqlalchemy import Column, Integer, String, DateTime, Text, Enum, Float, JSO
 from sqlalchemy.ext.declarative import declarative_base
 import enum
 from datetime import datetime, timezone
+import json
+from typing import List, Dict
+from sqlalchemy.sql import select
 
 Base = declarative_base()
 
@@ -19,8 +22,28 @@ class Message(Base):
     content = Column(Text, nullable=False)
     direction = Column(String, nullable=False)  # incoming/outgoing
     timestamp = Column(DateTime(timezone=True), nullable=False)
-    meta_data = Column(Text, nullable=True)
+    meta_data = Column(JSON)
     message_type = Column(Enum(MessageType), nullable=False, default=MessageType.GENERAL)
+
+    def to_dict(self):
+        """Convert message to dictionary for serialization"""
+        return {
+            "id": self.id,
+            "phone": self.phone,
+            "content": self.content,
+            "direction": self.direction,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+            "message_type": self.message_type.value if self.message_type else None,
+            "meta_data": self.meta_data
+        }
+
+    @classmethod
+    async def get_message_history(cls, from_number: str, session) -> List[Dict]:
+        """Get message history as list of dicts"""
+        query = select(cls).where(cls.phone == from_number)
+        result = await session.execute(query)
+        messages = result.scalars().all()
+        return [message.to_dict() for message in messages]
 
 class Product(Base):
     __tablename__ = "products"

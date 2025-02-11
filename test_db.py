@@ -1,14 +1,64 @@
-import asyncio
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from models import Base, Product, Customer
 from config import DATABASE_URL
+import asyncio
+from datetime import datetime, timezone
 
-async def test_connection():
+async def setup_test_data():
+    # Create async engine
     engine = create_async_engine(DATABASE_URL)
+    
     try:
-        async with engine.connect() as conn:
-            await conn.execute("SELECT 1")
-            print("Database connection successful!")
+        # Drop and recreate tables
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+            await conn.run_sync(Base.metadata.create_all)
+        
+        # Create session and add test data
+        async with AsyncSession(engine) as session:
+            # Add test products
+            products = [
+                Product(
+                    name="Steel",
+                    description="High-quality structural steel",
+                    price_per_kg=2.50,
+                    min_order_kg=100,
+                    available_kg=10000
+                ),
+                Product(
+                    name="Copper",
+                    description="Pure copper, ideal for electrical",
+                    price_per_kg=8.75,
+                    min_order_kg=50,
+                    available_kg=5000
+                ),
+                Product(
+                    name="Aluminium",
+                    description="Lightweight aluminium",
+                    price_per_kg=4.25,
+                    min_order_kg=75,
+                    available_kg=7500
+                )
+            ]
+            
+            # Add test customer
+            customer = Customer(
+                phone="+1234567890",
+                name="Abraham",
+                payment_info={"type": "visa", "card_ending": "4321"},
+                created_at=datetime.now(timezone.utc)
+            )
+            
+            session.add_all(products)
+            session.add(customer)
+            await session.commit()
+        
+        print("Test database initialized successfully!")
     except Exception as e:
-        print(f"Connection failed: {e}")
+        print(f"Database setup error: {str(e)}")
+        raise
+    finally:
+        await engine.dispose()
 
-asyncio.run(test_connection()) 
+if __name__ == "__main__":
+    asyncio.run(setup_test_data()) 
