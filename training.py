@@ -55,14 +55,28 @@ async def prepare_training_data(session: AsyncSession) -> List[Dict]:
     result = await session.execute(query)
     examples = result.scalars().all()
     
-    # Add debug logging
-    print(f"\nChecking training data quality...")
-    print(f"Total examples: {len(examples)}")
+    print("\n=== Training Data Quality Report ===")
+    print(f"Total examples found: {len(examples)}")
+    
     if examples:
-        print("Sample example:")
-        print(f"Customer: {examples[0].customer_message}")
-        print(f"Agent: {examples[0].agent_response}")
-        print(f"Metadata: {examples[0].meta_info}")
+        # Show 3 random examples
+        sample = random.sample(examples, min(3, len(examples)))
+        for i, ex in enumerate(sample, 1):
+            print(f"\nExample {i}:")
+            print(f"Customer: {ex.customer_message}")
+            print(f"Agent: {ex.agent_response}")
+            print(f"Metadata: {ex.meta_info}")
+            print("-" * 50)
+        
+        # Analyze data quality
+        print("\nData Analysis:")
+        print(f"Average customer message length: {sum(len(ex.customer_message) for ex in examples)/len(examples):.1f} chars")
+        print(f"Average agent response length: {sum(len(ex.agent_response) for ex in examples)/len(examples):.1f} chars")
+        print(f"Examples with metadata: {sum(1 for ex in examples if ex.meta_info)}/{len(examples)}")
+        
+        # Check language distribution
+        spanish = sum(1 for ex in examples if any(word in ex.agent_response.lower() for word in ['¿', 'é', 'ñ', 'ó']))
+        print(f"Spanish responses: {spanish}/{len(examples)} ({spanish/len(examples)*100:.1f}%)")
     
     return [{
         "customer_message": ex.customer_message,
