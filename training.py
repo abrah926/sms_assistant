@@ -364,6 +364,11 @@ class SalesModelTrainer:
                     log_message(f"Saving checkpoint at iteration {iteration}", "SAVE")
                     await self.save_checkpoint(iteration, iteration_scores, examples)
                 
+                # After processing samples and before next iteration
+                if iteration % 5 == 0:  # Show every 5 iterations
+                    log_message("Current Best Responses:", "INFO")
+                    self.show_best_responses()
+                
                 await asyncio.sleep(0.5)  # Prevent CPU overload
             
             log_message("=== Training Complete ===", "END")
@@ -683,3 +688,19 @@ Agent:"""
             score += 0.3  # Puerto Rican business Spanish tends to be less formal
             
         return min(score, 1.0)
+
+    def show_best_responses(self):
+        """Display current best responses"""
+        print("\n=== Current Best Responses ===")
+        if not self.best_responses:
+            print("No best responses stored yet")
+            return
+        
+        print(f"Total best responses stored: {len(self.best_responses)}")
+        # Show 3 random examples
+        sample_keys = random.sample(list(self.best_responses.keys()), min(3, len(self.best_responses)))
+        for i, key in enumerate(sample_keys, 1):
+            print(f"\nBest Response {i}:")
+            print(f"Customer: {key}")
+            print(f"Agent: {self.best_responses[key]}")
+            print("-" * 50)
