@@ -642,3 +642,22 @@ async def collect_training_data():
             print("=== Data collection complete ===\n")
             
         await asyncio.sleep(86400)  # Run daily
+
+@app.get("/debug/training")
+async def debug_training():
+    """Debug endpoint to check training state"""
+    try:
+        # Get all relevant info
+        debug_info = {
+            "training_status": training_status,
+            "active_tasks": len(asyncio.all_tasks()),
+            "llm_initialized": llm is not None,
+            "collector_initialized": collector is not None,
+            "current_time": datetime.now().isoformat(),
+            "server_uptime": "running",  # You can add actual uptime if needed
+        }
+        print("\n=== Training Debug Info ===")
+        print(json.dumps(debug_info, indent=2))
+        return debug_info
+    except Exception as e:
+        return {"error": str(e)}

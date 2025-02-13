@@ -55,6 +55,15 @@ async def prepare_training_data(session: AsyncSession) -> List[Dict]:
     result = await session.execute(query)
     examples = result.scalars().all()
     
+    # Add debug logging
+    print(f"\nChecking training data quality...")
+    print(f"Total examples: {len(examples)}")
+    if examples:
+        print("Sample example:")
+        print(f"Customer: {examples[0].customer_message}")
+        print(f"Agent: {examples[0].agent_response}")
+        print(f"Metadata: {examples[0].meta_info}")
+    
     return [{
         "customer_message": ex.customer_message,
         "agent_response": ex.agent_response,
@@ -73,21 +82,31 @@ class SalesModelTrainer:
         if self.latest_checkpoint:
             self._load_checkpoint(self.latest_checkpoint)
         
-        self.min_iterations = 1000
-        self.max_iterations = 2000  # Maximum iterations if still improving
-        self.convergence_threshold = 0.0001  # Stricter convergence threshold
-        self.improvement_window = 20  # Look at more iterations before stopping
-        self.target_score = 0.98  # Higher target score
+        # Adjust training parameters for DeepSeek
+        self.min_iterations = 50  # Reduced from 1000
+        self.max_iterations = 100  # Reduced from 2000
+        self.convergence_threshold = 0.001  # Less strict
+        self.improvement_window = 10  # Shorter window
+        self.target_score = 0.99
+        self.checkpoint_frequency = 5  # Save more frequently
+        
+        # Initialize training metrics
+        self.evaluation_metrics = {
+            'naturalness': 0.5,  # Start with baseline
+            'sales_effectiveness': 0.5,
+            'language_consistency': 0.5
+        }
+        
+        # Add debug info
+        print("\nModel Configuration:")
+        print(f"Model name: {LLM_MODEL_PATH}")
+        print(f"Tokenizer max length: {tokenizer.model_max_length}")
+        print(f"Target score: {self.target_score}")
+        
         self.data_collator = DataCollatorForLanguageModeling(
             tokenizer=tokenizer,
             mlm=False
         )
-        self.evaluation_metrics = {
-            'naturalness': 0,
-            'sales_effectiveness': 0,
-            'language_consistency': 0
-        }
-        self.checkpoint_frequency = 50  # Save every 50 iterations
         self.best_responses = {}  # Store best responses for A/B comparison
         self.ab_test_results = []  # Store A/B test results
         
@@ -143,6 +162,9 @@ class SalesModelTrainer:
                 "¿Ya decidiste qué vas a hacer?"
             ]
         }
+
+        # Add log counter
+        self.log_counter = 0
 
     def _get_latest_checkpoint(self):
         """Get the most recent checkpoint file"""
@@ -238,58 +260,105 @@ class SalesModelTrainer:
         torch.save(checkpoint, path)
         print(f"Checkpoint saved: {path}")
 
-    async def load_checkpoint(self, checkpoint_path: str):
-        """Load training checkpoint"""
-        if os.path.exists(checkpoint_path):
+    def _load_checkpoint(self, checkpoint_path):
+        """Load a checkpoint file"""
+        try:
+            print(f"Loading checkpoint: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path)
             self.model.load_state_dict(checkpoint['model_state'])
-            print(f"Restored checkpoint from iteration {checkpoint['iteration']}")
-            return checkpoint
-        return None
+            self.ab_test_results = checkpoint.get('ab_test_results', [])
+            self.best_responses = checkpoint.get('best_responses', {})
+            
+            # Add more detailed logging
+            print(f"Loaded checkpoint from iteration {checkpoint['iteration']}")
+            print(f"Previous best responses: {len(self.best_responses)}")
+            print(f"Previous AB test results: {len(self.ab_test_results)}")
+            
+            return checkpoint['iteration']
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            print("Starting with fresh model state")
+            return 0
 
     async def train_iteratively(self, session: AsyncSession, iterations: int = 50, status_callback = None):
-        """Train model iteratively with checkpointing and A/B testing"""
         try:
-            # Get starting iteration from latest checkpoint
-            start_iteration = 0
-            if self.latest_checkpoint:
-                checkpoint = torch.load(self.latest_checkpoint)
-                start_iteration = checkpoint['iteration']
-                print(f"Resuming from iteration {start_iteration}")
+            log_file = "logs/training.log"
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
             
-            print(f"\nStarting training for {iterations} iterations")
+            def log_message(msg, level="INFO"):
+                self.log_counter += 1
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                formatted_msg = f"[{self.log_counter:04d}][{timestamp}][{level}] {msg}"
+                
+                with open(log_file, "a") as f:
+                    f.write(formatted_msg + "\n")
+                print(formatted_msg)
+            
+            log_message("=== Starting Training Session ===", "START")
+            
+            # Check for existing checkpoints
+            if self.latest_checkpoint:
+                log_message(f"Found existing checkpoint: {self.latest_checkpoint}")
+                start_iteration = self._load_checkpoint(self.latest_checkpoint)
+                log_message(f"Resuming from iteration {start_iteration}")
+            else:
+                log_message("No existing checkpoint found - starting fresh", "WARN")
+                start_iteration = 0
             
             # Get training examples
             examples = await prepare_training_data(session)
             if not examples:
-                print("No training examples found!")
+                log_message("No training examples found!", "ERROR")
                 return None
             
-            print(f"Training with {len(examples)} examples")
+            log_message(f"Training with {len(examples)} examples")
+            
+            # Track best accuracy
+            best_accuracy = 0.0
+            running_accuracy = 0.0
             
             for iteration in range(start_iteration + 1, iterations + 1):
-                await asyncio.sleep(0.5)  # Prevent CPU overload
+                log_message(f"Starting iteration {iteration}/{iterations}", "ITER")
                 
-                if status_callback:
-                    accuracy = random.uniform(0.85, 0.98)
-                    status_callback(iteration, accuracy)
-                    print(f"Completed iteration {iteration}/{iterations}")
-                
-                # Training logic...
+                # Training logic
                 sample_size = min(100, len(examples))
                 sample = random.sample(examples, sample_size)
-                ab_pairs = await self.generate_ab_pairs(sample)
-                self.ab_test_results.extend(ab_pairs)
                 
-                # Save checkpoint every N iterations
+                # Process samples with progress
+                iteration_scores = []
+                for idx, ex in enumerate(sample, 1):
+                    if idx % 10 == 0:  # Log every 10 samples
+                        log_message(f"Processing sample {idx}/{sample_size}")
+                    
+                    response = await self.generate_response(ex['customer_message'])
+                    scores = self.score_response(response)
+                    iteration_scores.append(sum(scores.values()) / len(scores))
+                
+                current_accuracy = sum(iteration_scores) / len(iteration_scores)
+                running_accuracy = (running_accuracy * (iteration - 1) + current_accuracy) / iteration
+                best_accuracy = max(best_accuracy, running_accuracy)
+                
+                log_message(f"Iteration {iteration} Results:", "METRICS")
+                log_message(f"  Current Accuracy: {current_accuracy*100:.2f}%")
+                log_message(f"  Running Average: {running_accuracy*100:.2f}%")
+                log_message(f"  Best Accuracy: {best_accuracy*100:.2f}%")
+                
+                if status_callback:
+                    status_callback(iteration, running_accuracy)
+                
                 if iteration % self.checkpoint_frequency == 0:
-                    await self.save_checkpoint(iteration, [], examples)
+                    log_message(f"Saving checkpoint at iteration {iteration}", "SAVE")
+                    await self.save_checkpoint(iteration, iteration_scores, examples)
+                
+                await asyncio.sleep(0.5)  # Prevent CPU overload
             
-            await self.save_ab_results()
+            log_message("=== Training Complete ===", "END")
+            log_message(f"Final Accuracy: {running_accuracy*100:.2f}%")
+            log_message(f"Best Accuracy: {best_accuracy*100:.2f}%")
             return self.model
             
         except Exception as e:
-            print(f"Error in train_iteratively: {str(e)}")
+            log_message(f"Error in training: {str(e)}", "ERROR")
             raise
 
     def _should_stop_training(self, iteration: int, scores: list, stagnant_iterations: int) -> bool:
@@ -348,14 +417,25 @@ class SalesModelTrainer:
             
         return improved
 
-    def score_response(self, response):
-        """Score response on multiple dimensions"""
-        return {
-            'naturalness': self.score_naturalness(response),
-            'sales_effectiveness': self.score_sales_effectiveness(response),
-            'language_consistency': self.score_language_consistency(response),
-            'cultural_accuracy': self.score_cultural_fit(response)
-        }
+    def score_response(self, response: str) -> Dict[str, float]:
+        """Score response quality with adjusted weights"""
+        scores = {}
+        
+        # Naturalness (40% weight)
+        scores['naturalness'] = self.score_naturalness(response) * 0.4
+        
+        # Sales effectiveness (40% weight)
+        scores['sales_effectiveness'] = self.score_sales_effectiveness(response) * 0.4
+        
+        # Language consistency (20% weight)
+        scores['language_consistency'] = self.score_language_consistency(response) * 0.2
+        
+        # Debug scoring
+        print(f"\nScoring Response: {response[:100]}...")
+        print(f"Individual scores: {scores}")
+        print(f"Total score: {sum(scores.values())}")
+        
+        return scores
 
     def is_human_like(self, scores, threshold=0.9):
         """Check if response scores indicate human-like quality"""
