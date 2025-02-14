@@ -1,64 +1,42 @@
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from models import Base, Product, Customer
-from config import DATABASE_URL
-import asyncio
-from datetime import datetime, timezone
+import os
+import psycopg2
+from dotenv import load_dotenv
+from urllib.parse import quote_plus
 
-async def setup_test_data():
-    # Create async engine
-    engine = create_async_engine(DATABASE_URL)
-    
+load_dotenv()
+
+def test_connection():
     try:
-        # Drop and recreate tables
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all)
-            await conn.run_sync(Base.metadata.create_all)
+        password = quote_plus(os.getenv('PGPASSWORD', ''))
+        conn = psycopg2.connect(
+            host=os.getenv('PGHOST'),
+            database=os.getenv('PGDATABASE'),
+            user=os.getenv('PGUSER'),
+            password=password,
+            sslmode='disable'
+        )
+        print("Connection successful!")
         
-        # Create session and add test data
-        async with AsyncSession(engine) as session:
-            # Add test products
-            products = [
-                Product(
-                    name="Steel",
-                    description="High-quality structural steel",
-                    price_per_kg=2.50,
-                    min_order_kg=100,
-                    available_kg=10000
-                ),
-                Product(
-                    name="Copper",
-                    description="Pure copper, ideal for electrical",
-                    price_per_kg=8.75,
-                    min_order_kg=50,
-                    available_kg=5000
-                ),
-                Product(
-                    name="Aluminium",
-                    description="Lightweight aluminium",
-                    price_per_kg=4.25,
-                    min_order_kg=75,
-                    available_kg=7500
-                )
-            ]
-            
-            # Add test customer
-            customer = Customer(
-                phone="+1234567890",
-                name="Abraham",
-                payment_info={"type": "visa", "card_ending": "4321"},
-                created_at=datetime.now(timezone.utc)
-            )
-            
-            session.add_all(products)
-            session.add(customer)
-            await session.commit()
+        # Test a simple query
+        cur = conn.cursor()
+        cur.execute('SELECT version();')
+        version = cur.fetchone()
+        print(f"PostgreSQL version: {version[0]}")
         
-        print("Test database initialized successfully!")
+        cur.close()
+        conn.close()
+        
     except Exception as e:
-        print(f"Database setup error: {str(e)}")
-        raise
-    finally:
-        await engine.dispose()
+        print(f"Connection failed: {str(e)}")
+        print("\nTrying to get more connection details...")
+        try:
+            # Try to print more connection details for debugging
+            print(f"Host: {os.getenv('PGHOST')}")
+            print(f"Database: {os.getenv('PGDATABASE')}")
+            print(f"User: {os.getenv('PGUSER')}")
+            print(f"SSL Mode: disable")
+        except Exception as debug_e:
+            print(f"Error printing debug info: {debug_e}")
 
 if __name__ == "__main__":
-    asyncio.run(setup_test_data()) 
+    test_connection() 

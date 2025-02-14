@@ -79,3 +79,12 @@ class TrainingExample(Base):
     __table_args__ = (
         Index('idx_training_created', created_at),
     ) 
+
+class TrainingCheckpoint(Base):
+    __tablename__ = 'training_checkpoints'
+    
+    id = Column(Integer, primary_key=True)
+    step = Column(Integer, nullable=False)
+    path = Column(String, nullable=False)
+    loss = Column(Float)
+    created_at = Column(DateTime, default=datetime.utcnow) 
