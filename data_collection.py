@@ -1703,6 +1703,31 @@ class SalesDataCollector:
         }
         return min_orders.get(product.lower(), 50)  # Default 50 tons
 
+async def verify_datasets():
+    """Verify if we have all required datasets"""
+    print("\n=== Checking Training Datasets ===")
+    
+    try:
+        # Try loading datasets
+        from datasets import load_dataset
+        
+        print("Checking sales conversation datasets...")
+        datasets = [
+            "daily_dialog",
+            "AlekseyKorshuk/persona-chat",
+            "AlekseyKorshuk/salesforce-chat"
+        ]
+        
+        for ds_name in datasets:
+            try:
+                ds = load_dataset(ds_name, split="train")
+                print(f"✓ Found {ds_name}: {len(ds)} examples")
+            except Exception as e:
+                print(f"✗ Missing {ds_name}: {str(e)}")
+                
+    except Exception as e:
+        print(f"Error checking datasets: {e}")
+
 async def collect_training_data():
     """Periodic data collection task"""
     while True:
@@ -1727,3 +1752,44 @@ async def collect_training_data():
         except Exception as e:
             print(f"Error in data collection: {str(e)}")
             await asyncio.sleep(300)  # Wait 5 minutes before retrying 
+
+async def prepare_training_data(session: AsyncSession) -> List[Dict]:
+    """Get training examples from database"""
+    try:
+        # Only use sales-specific datasets
+        datasets = [
+            "goendalf666/sales-conversations",  # Sales specific
+            "AlekseyKorshuk/salesforce-chat"    # Sales specific
+        ]
+        
+        examples = []
+        for ds_name in datasets:
+            try:
+                ds = load_dataset(ds_name, split="train")
+                print(f"Loaded {ds_name}: {len(ds)} examples")
+                examples.extend([{
+                    "customer_message": ex["customer"],
+                    "agent_response": ex["agent"],
+                    "metadata": {"source": ds_name}
+                } for ex in ds])
+            except Exception as e:
+                print(f"Error loading {ds_name}: {e}")
+                
+        # Add our own examples
+        query = select(TrainingExample).where(
+            TrainingExample.score >= 0.8  # Only use good examples
+        ).order_by(TrainingExample.created_at.desc())
+        
+        result = await session.execute(query)
+        db_examples = result.scalars().all()
+        examples.extend([{
+            "customer_message": ex.customer_message,
+            "agent_response": ex.agent_response,
+            "metadata": ex.meta_info
+        } for ex in db_examples])
+        
+        return examples
+        
+    except Exception as e:
+        print(f"Error preparing training data: {e}")
+        return [] 

@@ -1,10 +1,12 @@
 from transformers import (
     Trainer, 
     TrainingArguments,
-    DataCollatorForLanguageModeling
+    DataCollatorForLanguageModeling,
+    AutoModelForCausalLM,
+    AutoTokenizer
 )
 from torch.utils.data import Dataset
-from typing import List, Dict
+from typing import List, Dict, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from models import TrainingExample
@@ -16,6 +18,8 @@ import json
 from datetime import datetime
 import random
 import asyncio
+import shutil
+import glob
 
 class SalesConversationDataset(Dataset):
     def __init__(self, tokenizer, examples: List[Dict], max_length: int = 512):
@@ -84,25 +88,60 @@ async def prepare_training_data(session: AsyncSession) -> List[Dict]:
         "metadata": ex.meta_info
     } for ex in examples]
 
+def log_message(msg: str, level: str = "INFO") -> None:
+    """Unified logging function"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    formatted_msg = f"[{timestamp}][{level}] {msg}"
+    print(formatted_msg)
+
 class SalesModelTrainer:
     def __init__(self, model, tokenizer):
-        self.model = model
-        self.tokenizer = tokenizer
+        if model is None or tokenizer is None:
+            raise ValueError("Model and tokenizer must be provided")
+            
+        # Try loading from local first
+        try:
+            print("Loading model from local storage...")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                "models/mistral",
+                torch_dtype=torch.float32,
+                low_cpu_mem_usage=True
+            ).to(DEVICE)
+            self.tokenizer = AutoTokenizer.from_pretrained("models/mistral")
+        except Exception as e:
+            print(f"Error loading local model: {e}")
+            print("Falling back to original model")
+            self.model = model.to(DEVICE)
+            self.tokenizer = tokenizer
+
         self.checkpoint_dir = "checkpoints"
         os.makedirs(self.checkpoint_dir, exist_ok=True)
+        
+        # Better learning rate management
+        self.warmup_steps = 100
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=1e-6)  # Start with lower learning rate
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=1e-5,
+            total_steps=self.warmup_steps,
+            pct_start=0.3
+        )
+        
+        # Initialize best responses with correct structure
+        self.best_responses = {}  # Dict[str, List[Dict]]
         
         # Initialize checkpoint tracking
         self.latest_checkpoint = self._get_latest_checkpoint()
         if self.latest_checkpoint:
             self._load_checkpoint(self.latest_checkpoint)
         
-        # Adjust training parameters for DeepSeek
-        self.min_iterations = 50  # Reduced from 1000
-        self.max_iterations = 100  # Reduced from 2000
-        self.convergence_threshold = 0.001  # Less strict
-        self.improvement_window = 10  # Shorter window
+        # Adjust training parameters
+        self.min_iterations = 50
+        self.max_iterations = 100
+        self.convergence_threshold = 0.001
+        self.improvement_window = 10
         self.target_score = 0.99
-        self.checkpoint_frequency = 5  # Save more frequently
+        self.checkpoint_frequency = 1  # Changed from 5 to 1 - save every iteration
         
         # Initialize training metrics
         self.evaluation_metrics = {
@@ -121,7 +160,6 @@ class SalesModelTrainer:
             tokenizer=tokenizer,
             mlm=False
         )
-        self.best_responses = {}  # Store best responses for A/B comparison
         self.ab_test_results = []  # Store A/B test results
         
         # Expand Puerto Rican Spanish variations
@@ -259,34 +297,91 @@ class SalesModelTrainer:
         
         return overlap / total if total > 0 else 0 
 
+    def backup_checkpoint(self, checkpoint_path: str):
+        """Create a backup of the checkpoint"""
+        try:
+            # Create backups directory if it doesn't exist
+            backup_dir = "checkpoints/backups"
+            os.makedirs(backup_dir, exist_ok=True)
+            
+            # Create backup with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = f"{backup_dir}/backup_{timestamp}.pt"
+            
+            # Copy checkpoint to backup
+            shutil.copy2(checkpoint_path, backup_path)
+            print(f"Created backup: {backup_path}")
+            
+            # Keep only last 5 backups to save space
+            backups = sorted(glob.glob(f"{backup_dir}/backup_*.pt"))
+            if len(backups) > 5:
+                for old_backup in backups[:-5]:
+                    os.remove(old_backup)
+                
+        except Exception as e:
+            print(f"Error creating backup: {e}")
+
     async def save_checkpoint(self, iteration: int, scores: list, examples: list):
-        """Save training checkpoint"""
-        checkpoint = {
-            'iteration': iteration,
-            'model_state': self.model.state_dict(),
-            'scores': scores,
-            'best_responses': self.best_responses,
-            'timestamp': datetime.now().isoformat(),
-            'examples_processed': len(examples)
-        }
-        
-        path = f"{self.checkpoint_dir}/checkpoint_{iteration}.pt"
-        torch.save(checkpoint, path)
-        print(f"Checkpoint saved: {path}")
+        """Save training checkpoint with verification"""
+        try:
+            checkpoint = {
+                'iteration': iteration,
+                'model_state': self.model.state_dict(),
+                'optimizer_state': self.optimizer.state_dict(),
+                'scheduler_state': self.scheduler.state_dict(),
+                'scores': scores,
+                'best_responses': self.best_responses,
+                'timestamp': datetime.now().isoformat(),
+                'examples_processed': len(examples),
+                'running_accuracy': sum(scores) / len(scores) if scores else 0
+            }
+            
+            # Save main checkpoint
+            path = f"{self.checkpoint_dir}/checkpoint_{iteration}.pt"
+            torch.save(checkpoint, path)
+            
+            # Verify save
+            if not os.path.exists(path):
+                raise Exception(f"Checkpoint file not created: {path}")
+            
+            # Verify can load
+            test_load = torch.load(path)
+            if 'iteration' not in test_load:
+                raise Exception("Checkpoint data incomplete")
+            
+            print(f"✓ Checkpoint saved and verified: {path}")
+            
+            # Create backup with verification
+            backup_dir = os.path.join(self.checkpoint_dir, "backups")
+            backup_path = f"{backup_dir}/backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
+            shutil.copy2(path, backup_path)
+            
+            if not os.path.exists(backup_path):
+                raise Exception(f"Backup not created: {backup_path}")
+            
+            print(f"✓ Backup created and verified: {backup_path}")
+            
+        except Exception as e:
+            print(f"❌ Error saving checkpoint: {e}")
+            raise  # Make sure we see the error
 
     def _load_checkpoint(self, checkpoint_path):
         """Load a checkpoint file"""
         try:
             print(f"Loading checkpoint: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path)
+            
+            # Load model and training states
             self.model.load_state_dict(checkpoint['model_state'])
-            self.ab_test_results = checkpoint.get('ab_test_results', [])
+            if 'optimizer_state' in checkpoint:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+            if 'scheduler_state' in checkpoint:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state'])
+            
             self.best_responses = checkpoint.get('best_responses', {})
             
-            # Add more detailed logging
             print(f"Loaded checkpoint from iteration {checkpoint['iteration']}")
             print(f"Previous best responses: {len(self.best_responses)}")
-            print(f"Previous AB test results: {len(self.ab_test_results)}")
             
             return checkpoint['iteration']
         except Exception as e:
@@ -296,88 +391,80 @@ class SalesModelTrainer:
 
     async def train_iteratively(self, session: AsyncSession, iterations: int = 50, status_callback = None):
         try:
-            log_file = "logs/training.log"
-            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            # Initial setup logs
+            print("\n=== Training Pipeline Check ===")
+            print(f"[1] Model: {LLM_MODEL_PATH}")
+            print(f"[2] Device: {DEVICE}")
+            print(f"[3] Model loaded: {self.model is not None}")
+            print(f"[4] Tokenizer loaded: {self.tokenizer is not None}")
             
-            def log_message(msg, level="INFO"):
-                self.log_counter += 1
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                formatted_msg = f"[{self.log_counter:04d}][{timestamp}][{level}] {msg}"
-                
-                with open(log_file, "a") as f:
-                    f.write(formatted_msg + "\n")
-                print(formatted_msg)
-            
-            log_message("=== Starting Training Session ===", "START")
-            
-            # Check for existing checkpoints
-            if self.latest_checkpoint:
-                log_message(f"Found existing checkpoint: {self.latest_checkpoint}")
-                start_iteration = self._load_checkpoint(self.latest_checkpoint)
-                log_message(f"Resuming from iteration {start_iteration}")
-            else:
-                log_message("No existing checkpoint found - starting fresh", "WARN")
-                start_iteration = 0
-            
-            # Get training examples
+            # Test generation
+            print("\n[5] Testing model generation...")
+            test_input = "Hello, I need steel plates"
+            try:
+                test_response = await self.generate_response(test_input)
+                print(f"Test output: {test_response[:100]}...")
+            except Exception as e:
+                print(f"❌ Generation failed: {e}")
+                return None
+
+            # Load training data
             examples = await prepare_training_data(session)
             if not examples:
-                log_message("No training examples found!", "ERROR")
+                print("❌ [6] No training examples found!")
                 return None
             
-            log_message(f"Training with {len(examples)} examples")
+            print(f"\n[7] Training data loaded: {len(examples)} examples")
             
-            # Track best accuracy
+            # Track metrics
             best_accuracy = 0.0
             running_accuracy = 0.0
+            validation_losses = []
             
-            for iteration in range(start_iteration + 1, iterations + 1):
-                log_message(f"Starting iteration {iteration}/{iterations}", "ITER")
+            for iteration in range(1, iterations + 1):
+                print(f"\n[{iteration+7}] === Iteration {iteration}/{iterations} ===")
                 
-                # Training logic
-                sample_size = min(100, len(examples))
-                sample = random.sample(examples, sample_size)
-                
-                # Process samples with progress
+                # Training loop
                 iteration_scores = []
-                for idx, ex in enumerate(sample, 1):
-                    if idx % 10 == 0:  # Log every 10 samples
-                        log_message(f"Processing sample {idx}/{sample_size}")
-                    
+                for idx, ex in enumerate(examples, 1):
                     response = await self.generate_response(ex['customer_message'])
-                    scores = self.score_response(response)
-                    iteration_scores.append(sum(scores.values()) / len(scores))
+                    scores = self.score_response(response, ex['customer_message'])
+                    score = sum(scores.values()) / len(scores)
+                    iteration_scores.append(score)
+                    
+                    # Learn from examples silently
+                    if score < 0.8:  # Only show scores below threshold
+                        print(f"Sample {idx}: Score {score*100:.1f}%")
                 
+                # Show iteration metrics
                 current_accuracy = sum(iteration_scores) / len(iteration_scores)
                 running_accuracy = (running_accuracy * (iteration - 1) + current_accuracy) / iteration
                 best_accuracy = max(best_accuracy, running_accuracy)
                 
-                log_message(f"Iteration {iteration} Results:", "METRICS")
-                log_message(f"  Current Accuracy: {current_accuracy*100:.2f}%")
-                log_message(f"  Running Average: {running_accuracy*100:.2f}%")
-                log_message(f"  Best Accuracy: {best_accuracy*100:.2f}%")
+                print(f"\nMetrics:")
+                print(f"- Current: {current_accuracy*100:.1f}%")
+                print(f"- Running: {running_accuracy*100:.1f}%")
+                print(f"- Best: {best_accuracy*100:.1f}%")
                 
-                if status_callback:
-                    status_callback(iteration, running_accuracy)
+                # Validation
+                validation_loss = await self.validate_model(examples)
+                print(f"- Validation loss: {validation_loss:.4f}")
                 
-                if iteration % self.checkpoint_frequency == 0:
-                    log_message(f"Saving checkpoint at iteration {iteration}", "SAVE")
-                    await self.save_checkpoint(iteration, iteration_scores, examples)
+                # Early stopping check
+                validation_losses.append(validation_loss)
+                if len(validation_losses) > 3 and all(validation_losses[-3:] > validation_losses[-4:-1]):
+                    print("\n⚠️ Stopping early - validation loss increasing")
+                    break
                 
-                # After processing samples and before next iteration
-                if iteration % 5 == 0:  # Show every 5 iterations
-                    log_message("Current Best Responses:", "INFO")
-                    self.show_best_responses()
-                
-                await asyncio.sleep(0.5)  # Prevent CPU overload
+                await asyncio.sleep(0.5)
             
-            log_message("=== Training Complete ===", "END")
-            log_message(f"Final Accuracy: {running_accuracy*100:.2f}%")
-            log_message(f"Best Accuracy: {best_accuracy*100:.2f}%")
+            print("\n=== Training Complete ===")
+            print(f"Final accuracy: {running_accuracy*100:.1f}%")
+            print(f"Best accuracy: {best_accuracy*100:.1f}%")
             return self.model
             
         except Exception as e:
-            log_message(f"Error in training: {str(e)}", "ERROR")
+            print(f"\n❌ Error in training: {str(e)}")
             raise
 
     def _should_stop_training(self, iteration: int, scores: list, stagnant_iterations: int) -> bool:
@@ -422,7 +509,7 @@ class SalesModelTrainer:
             response = await self.generate_response(ex['customer_message'])
             
             # Score response
-            scores = self.score_response(response)
+            scores = self.score_response(response, ex['customer_message'])
             
             # Improve if needed
             if not self.is_human_like(scores):
@@ -436,217 +523,86 @@ class SalesModelTrainer:
             
         return improved
 
-    def score_response(self, response: str) -> Dict[str, float]:
-        """Score response quality with adjusted weights"""
-        scores = {}
-        
-        # Naturalness (40% weight)
-        scores['naturalness'] = self.score_naturalness(response) * 0.4
-        
-        # Sales effectiveness (40% weight)
-        scores['sales_effectiveness'] = self.score_sales_effectiveness(response) * 0.4
-        
-        # Language consistency (20% weight)
-        scores['language_consistency'] = self.score_language_consistency(response) * 0.2
-        
-        # Debug scoring
-        print(f"\nScoring Response: {response[:100]}...")
-        print(f"Individual scores: {scores}")
-        print(f"Total score: {sum(scores.values())}")
-        
-        return scores
-
-    def is_human_like(self, scores, threshold=0.9):
-        """Check if response scores indicate human-like quality"""
-        return all(score > threshold for score in scores.values())
-
-    async def improve_response(self, response, scores):
-        """Improve response based on scores"""
-        improvements = []
-        
-        if scores['naturalness'] < 0.9:
-            response = self.add_conversational_elements(response)
-            
-        if scores['sales_effectiveness'] < 0.9:
-            response = self.enhance_sales_elements(response)
-            
-        if scores['language_consistency'] < 0.9:
-            response = self.fix_language_consistency(response)
-            
-        if scores['cultural_accuracy'] < 0.9:
-            response = self.adjust_cultural_elements(response)
-            
-        return response
-
-    def check_convergence(self, old_metrics, new_metrics, threshold=0.001):
-        """Check if model has converged to optimal performance"""
-        improvements = [
-            new_metrics[key] - old_metrics[key]
-            for key in old_metrics
-        ]
-        return all(imp < threshold for imp in improvements)
-
-    async def generate_ab_pairs(self, examples):
-        """Generate A/B test pairs for each example"""
-        ab_pairs = []
-        
-        for ex in examples:
-            # Generate two different responses
-            response_a = await self.generate_response(ex['customer_message'], style='standard')
-            response_b = await self.generate_response(ex['customer_message'], style='enhanced')
-            
-            # Score both responses
-            score_a = self.score_response(response_a)
-            score_b = self.score_response(response_b)
-            
-            pair = {
-                'customer_message': ex['customer_message'],
-                'variation_a': {
-                    'response': response_a,
-                    'scores': score_a
-                },
-                'variation_b': {
-                    'response': response_b,
-                    'scores': score_b
-                },
-                'metadata': ex.get('metadata', {})
-            }
-            
-            ab_pairs.append(pair)
-            
-            # Store the better response
-            if sum(score_b.values()) > sum(score_a.values()):
-                self.best_responses[ex['customer_message']] = response_b
-            else:
-                self.best_responses[ex['customer_message']] = response_a
-                
-        return ab_pairs
-
-    async def save_ab_results(self):
-        """Save A/B test results for review"""
-        results = {
-            'timestamp': datetime.now().isoformat(),
-            'total_examples': len(self.ab_test_results),
-            'ab_pairs': self.ab_test_results
-        }
-        
-        with open('ab_test_results.json', 'w') as f:
-            json.dump(results, f, indent=2)
-            
-        print("\nA/B test results saved. You can review them in ab_test_results.json")
-
-    async def generate_response(self, message: str, style: str = 'standard') -> str:
-        """Generate a response using the model"""
+    def score_response(self, response: str, customer_message: str) -> Dict[str, float]:
+        """Score response quality with language checks"""
         try:
-            # Format input
-            prompt = f"""System: You are a professional metal sales agent.
-Customer: {message}
-Agent:"""
+            # Reject responses with non-English/Spanish characters
+            if any(ord(c) > 127 and c not in 'áéíóúüñ¿¡' for c in response):
+                return {'naturalness': 0, 'sales_effectiveness': 0, 'language_consistency': 0}
             
-            # Add style-specific instructions
-            if style == 'enhanced':
-                prompt = f"""System: You are a professional metal sales agent. Use Puerto Rican Spanish and Spanglish naturally.
-Include common Puerto Rican expressions and industry terms.
-Customer: {message}
-Agent:"""
+            scores = {}
             
-            # Tokenize
-            inputs = self.tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=512
-            ).to(self.model.device)
+            # Calculate scores silently
+            natural_score = self.score_naturalness(response)
+            sales_score = self.score_sales_effectiveness(response)
+            lang_score = self.score_language_consistency(response)
             
-            # Generate
-            outputs = self.model.generate(
-                **inputs,
-                max_length=200,
-                num_return_sequences=1,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True,
-                pad_token_id=self.tokenizer.pad_token_id
-            )
+            scores['naturalness'] = natural_score * 0.3
+            scores['sales_effectiveness'] = sales_score * 0.4
+            scores['language_consistency'] = lang_score * 0.3
             
-            # Decode response
-            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            total_score = sum(scores.values())
             
-            # Clean up response
-            response = response.replace(prompt, "").strip()
+            # Log to file if score is good
+            if total_score > 0.8:
+                self.log_best_response(customer_message, response, total_score)
             
-            # Add Puerto Rican elements if enhanced style
-            if style == 'enhanced':
-                response = self.add_puerto_rican_elements(response)
-            
-            return response
+            return scores
             
         except Exception as e:
-            print(f"Error generating response: {e}")
-            return "Lo siento, hubo un error. ¿Puedes repetir la pregunta?"
-
-    def add_puerto_rican_elements(self, response: str) -> str:
-        """Add Puerto Rican expressions and style to response"""
-        # Add greeting if not present
-        if not any(g in response for g in self.pr_spanish_responses["greetings"]):
-            response = f"{random.choice(self.pr_spanish_responses['greetings'])} {response}"
-        
-        # Add casual expression
-        if random.random() > 0.5:
-            response += f" {random.choice(self.pr_spanish_responses['casual_responses'])}"
-        
-        # Add closing if not present
-        if not any(c in response for c in self.pr_spanish_responses["closings"]):
-            response += f" {random.choice(self.pr_spanish_responses['closings'])}"
-        
-        return response
+            print(f"Error in scoring: {e}")
+            return {'error': 0.0}
 
     def score_naturalness(self, response: str) -> float:
         """Score how natural the response sounds"""
         score = 0.0
         
-        # Check for presence of greetings
-        if any(g in response.lower() for g in self.pr_spanish_responses["greetings"]):
+        # Check for conversational elements
+        if any(greeting in response.lower() for greeting in ["hello", "hi", "hey", "hola", "saludos"]):
             score += 0.2
-            
-        # Check for casual expressions
-        if any(c in response.lower() for c in self.pr_spanish_responses["casual_responses"]):
+        
+        # Check for proper punctuation and structure
+        if "?" in response and "!" in response:  # Engaging punctuation
             score += 0.2
-            
-        # Check for natural closings
-        if any(c in response.lower() for c in self.pr_spanish_responses["closings"]):
+        
+        # Check for natural flow markers
+        flow_markers = ["well", "so", "now", "also", "but", "and", "or", "pues", "entonces"]
+        if any(marker in response.lower() for marker in flow_markers):
             score += 0.2
-            
-        # Check for Spanglish elements
-        if any(s in response.lower() for s in self.pr_spanish_responses["spanglish"]):
+        
+        # Check response length (too short or too long is unnatural)
+        words = len(response.split())
+        if 10 <= words <= 50:  # Good length for a response
             score += 0.2
-            
-        # Check sentence structure and flow
-        if len(response.split()) >= 5 and "." in response:
+        
+        # Check for personalization
+        if any(personal in response.lower() for personal in ["you", "your", "tu", "usted", "su"]):
             score += 0.2
-            
+        
+        print(f"Naturalness breakdown: {score*100:.2f}%")
         return min(score, 1.0)
 
     def score_sales_effectiveness(self, response: str) -> float:
         """Score sales effectiveness of response"""
         score = 0.0
         
-        # Check for price discussion
-        if any(term in response.lower() for term in ["precio", "costo", "deal", "discount", "$"]):
+        # Check for price/deal discussion
+        if any(term in response.lower() for term in ["price", "deal", "discount", "offer", "special", "precio", "descuento"]):
             score += 0.25
-            
+        
         # Check for call to action
-        if any(term in response.lower() for term in ["¿", "?", "podemos", "quieres", "necesitas"]):
+        if any(term in response.lower() for term in ["order", "buy", "purchase", "get", "comprar", "ordenar"]):
             score += 0.25
-            
-        # Check for value proposition
-        if any(term in response.lower() for term in ["calidad", "mejor", "garantía", "servicio"]):
+        
+        # Check for product information
+        if any(term in response.lower() for term in ["quality", "features", "benefits", "calidad", "beneficios"]):
             score += 0.25
-            
+        
         # Check for urgency/closing
-        if any(term in response.lower() for term in ["ahora", "hoy", "special", "limited"]):
+        if any(term in response.lower() for term in ["today", "now", "limited", "ahora", "hoy", "pronto"]):
             score += 0.25
-            
+        
+        print(f"Sales effectiveness breakdown: {score*100:.2f}%")
         return min(score, 1.0)
 
     def score_language_consistency(self, response: str) -> float:
@@ -704,3 +660,132 @@ Agent:"""
             print(f"Customer: {key}")
             print(f"Agent: {self.best_responses[key]}")
             print("-" * 50)
+
+    async def learn_from_example(self, customer_message: str, good_response: str):
+        """Learn from a good example with gradient accumulation"""
+        try:
+            self.model.train()
+            accumulated_loss = 0
+            accumulation_steps = 4  # Accumulate over 4 steps for stability
+            
+            for _ in range(accumulation_steps):
+                # Format with slight variations for robustness
+                conversation = f"""System: You are a professional metal sales agent.
+Customer: {customer_message}
+Agent: {good_response}"""
+
+                inputs = self.tokenizer(
+                    conversation,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=512
+                ).to(DEVICE)
+
+                outputs = self.model(**inputs, labels=inputs["input_ids"])
+                loss = outputs.loss / accumulation_steps  # Scale loss
+                accumulated_loss += loss.item()
+                
+                # Backward pass
+                loss.backward()
+            
+            # Clip gradients and optimize
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            self.scheduler.step()
+            self.optimizer.zero_grad()
+            
+            print(f"Learned from example (avg loss: {accumulated_loss/accumulation_steps:.4f})")
+            return accumulated_loss/accumulation_steps
+            
+        except Exception as e:
+            print(f"Error learning from example: {e}")
+            return None
+
+    async def generate_response(self, message: str) -> str:
+        try:
+            # Mistral v0.2 specific prompt format
+            messages = [
+                {"role": "system", "content": "You are a professional metal sales agent. You are knowledgeable about steel, aluminum, copper and other metals. Always be professional and focus on making sales."},
+                {"role": "user", "content": message}
+            ]
+            
+            # Use Mistral's chat template with attention mask
+            model_inputs = self.tokenizer.apply_chat_template(
+                messages,
+                return_tensors="pt",
+                add_generation_prompt=True
+            )
+            
+            attention_mask = torch.ones_like(model_inputs)  # Create attention mask
+            inputs = {
+                "input_ids": model_inputs.to(DEVICE),
+                "attention_mask": attention_mask.to(DEVICE)
+            }
+            
+            self.model.eval()
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_length=200,
+                    temperature=0.7,
+                    top_p=0.95,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+            
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Clean up response to get only the assistant's part
+            response = response.split("[/INST]")[-1].strip()
+            return response
+            
+        except Exception as e:
+            print(f"Error generating: {e}")
+            return ""
+
+    def is_human_like(self, scores: Dict[str, float], threshold: float = 0.8) -> bool:
+        """Check if response meets human-like threshold"""
+        total_score = sum(scores.values()) / len(scores)
+        return total_score >= threshold
+
+    async def improve_response(self, response: str, scores: Dict[str, float]) -> str:
+        """Improve a response based on scores"""
+        try:
+            # If response needs improvement, generate a new one with more context
+            prompt = f"""Improve this response to be more natural and effective:
+Previous response: {response}
+Make it more: {', '.join(k for k, v in scores.items() if v < 0.8)}
+"""
+            return await self.generate_response(prompt)
+        except Exception as e:
+            log_message(f"Error improving response: {e}", "ERROR")
+            return response
+
+    async def validate_model(self, validation_examples):
+        """Run validation on a subset of examples"""
+        self.model.eval()
+        total_loss = 0
+        with torch.no_grad():
+            for ex in validation_examples:
+                response = await self.generate_response(ex['customer_message'])
+                scores = self.score_response(response, ex['customer_message'])
+                total_loss += 1 - (sum(scores.values()) / len(scores))
+        return total_loss / len(validation_examples)
+
+    def log_best_response(self, customer_message: str, response: str, score: float):
+        """Log best responses to file"""
+        try:
+            log_path = "logs/best_responses.jsonl"
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            
+            entry = {
+                "timestamp": datetime.now().isoformat(),
+                "customer": customer_message,
+                "response": response,
+                "score": score
+            }
+            
+            with open(log_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+            
+        except Exception as e:
+            print(f"Error logging best response: {e}")

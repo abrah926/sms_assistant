@@ -28,89 +28,45 @@ venv/
 ENV/
 env/
 
+# Docker
+Dockerfile
+.docker/
+docker-compose.yml
+docker-compose.override.yml
+.dockerignore
+
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
 .DS_Store
+
+# Model & Training
+models/
+checkpoints/
+logs/
+*.pt
+*.pth
+*.bin
+*.safetensors
+lora_checkpoint/
+mistral-finetuned-lora/
 
 # Database
-*.sqlite3
 *.db
+*.sqlite3
 
-# Logs
-*.log
-logs/
-log/
+# Migration versions
+migrations/versions/*
+!migrations/versions/.gitkeep
 
-# Temp files
-*.tmp
-.temp/
-tmp/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# Local development settings
-local_settings.py
-
-# Test cache
-.pytest_cache/
+# Misc
 .coverage
 htmlcov/
-
-# Prometheus metrics
-prometheus/
-prometheus_data/
-
-# Model cache
-.cache/
-.huggingface/ google-chrome-stable_current_amd64.deb
-# Python
-__pycache__/
-*.py[cod]
-*.class
-*.so
-.Python
-env/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual Environment
-venv/
-ENV/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Large files
-*.deb
-*.iso
-*.tar
-*.gz
-*.zip
-
-# Project specific
-.env
+.pytest_cache/
+.mypy_cache/
 *.log
-*.deb
+temp/
+tmp/
+.env.*
