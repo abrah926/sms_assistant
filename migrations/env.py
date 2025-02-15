@@ -20,15 +20,16 @@ config = context.config
 
 # Set up the database URL
 def get_url():
-    password = quote_plus(os.getenv('PGPASSWORD', ''))
-    sslmode = os.getenv('PGSSLMODE', 'verify-ca')
-    sslrootcert = os.path.expanduser(os.getenv('PGSSLROOTCERT', '~/.postgresql/root.crt'))
-    
-    return (f"postgresql://{os.getenv('PGUSER')}:{password}@"
-            f"{os.getenv('PGHOST')}:{os.getenv('PGPORT', '5432')}/{os.getenv('PGDATABASE')}"
-            f"?sslmode={sslmode}&sslrootcert={sslrootcert}")
+    pg_user = os.getenv("PGUSER", "default_user")
+    pg_password = os.getenv("PGPASSWORD", "default_password")
+    pg_host = os.getenv("PGHOST", "localhost")
+    pg_port = os.getenv("PGPORT", "5432")
+    pg_database = os.getenv("PGDATABASE", "postgres")
+    pg_sslmode = os.getenv("PGSSLMODE", "verify-ca")
+    pg_sslrootcert = os.getenv("PGSSLROOTCERT", "/etc/ssl/certs/azure-postgres.crt")
 
-# Override the SQLAlchemy URL with our constructed one
+    return f"postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_database}?sslmode={pg_sslmode}&sslrootcert={pg_sslrootcert}"
+
 config.set_main_option("sqlalchemy.url", get_url())
 
 # Interpret the config file for Python logging
