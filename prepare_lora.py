@@ -6,7 +6,7 @@ import os
 import json
 from models import TrainingExample, TrainingCheckpoint
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, Session
 from config import DATABASE_URL
 from datetime import datetime
 from pathlib import Path
@@ -210,8 +210,8 @@ class CheckpointCallback(TrainerCallback):
             "prompt": prompt,
             "response": response,
             "scores": scores,
-            "checkpoint_step": state.global_step,
-            "training_loss": state.log_history[-1].get('loss', 'N/A')
+            "checkpoint_step": self.trainer.state.global_step,
+            "training_loss": self.trainer.state.log_history[-1].get('loss', 'N/A')
         }
         
         with open(self.best_responses_file, "a") as f:
