@@ -100,7 +100,7 @@ class CheckpointCallback(TrainerCallback):
         print(f"\n=== Checkpoint {state.global_step} Analysis ===")
         
         try:
-            # Test prompts with different scenarios
+            # Test prompts
             test_prompts = [
                 # Price inquiries
                 "What's your best price on 500kg of steel?",
