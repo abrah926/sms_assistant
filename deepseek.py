@@ -1,13 +1,15 @@
-from datasets import load_dataset
+import json
 import chromadb
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
-from concurrent.futures import ThreadPoolExecutor
 
-# ✅ Use DeepSeek-R1 7B instead of 67B
+# ✅ Use DeepSeek-R1 7B
 MODEL_PATH = "/home/abraham/models/deepseek-7b"
 
-print("Loading DeepSeek-R1 7B on CPU with optimized RAM usage...")
+def log(message):
+    print(f"✅ {message}")
+
+log("Loading DeepSeek-R1 7B on CPU with optimized RAM usage...")
 
 # ✅ Load tokenizer
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
@@ -22,94 +24,107 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 model.eval()  # Set to evaluation mode
-print("✅ DeepSeek-R1 7B is loaded on CPU with OPTIMIZED RAM USAGE!")
+log("DeepSeek-R1 7B is loaded on CPU with OPTIMIZED RAM USAGE!")
 
-# ✅ List of datasets (Sales Conversations FIRST)
-datasets_list = [
-    "goendalf666/sales-conversations",  # PRIORITY
-    "ag_news",
-    "AlekseyKorshuk/persona-chat",
-    "blended_skill_talk",
-    "daily_dialog",
-    "multi_woz_v22"
-]
+# ✅ Load Custom Dataset
+DATASET_PATH = "DeepSeek_dataset.json"
+with open(DATASET_PATH, "r") as f:
+    dataset = json.load(f)
+
+log(f"Loaded custom dataset from {DATASET_PATH}, containing {len(dataset)} examples.")
 
 # ✅ Initialize ChromaDB (Persistent Storage)
+# ✅ Initialize ChromaDB (Ensure Persistent Storage)
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
-# ✅ Function to Embed Text (Fixed Output Processing)
+# ✅ Force Delete Old Collection to Reset Dimension
+try:
+    chroma_client.delete_collection(name="deepseek_custom")  # Ensure old collection is removed
+    print("✅ Old ChromaDB collection deleted.")
+except Exception as e:
+    print(f"⚠️ Warning: {e}")
+
+# ✅ Recreate Collection with Correct Dimension (485)
+collection = chroma_client.get_or_create_collection(name="deepseek_custom", metadata={"dim": 485})
+print(f"✅ ChromaDB collection created with dimension: {collection.metadata}")
+
+# ✅ Function to Embed Text
 def embed_text(text):
     """Generate embeddings using DeepSeek-R1 7B."""
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512).to("cpu")
+    inputs = tokenizer(
+        text, return_tensors="pt", truncation=True, max_length=512, padding=True
+    ).to("cpu", non_blocking=True)
+
     with torch.no_grad():
-        outputs = model.generate(inputs["input_ids"], max_length=128)
-    return outputs[0].cpu().numpy().tolist()
+        outputs = model.generate(
+            inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            pad_token_id=tokenizer.eos_token_id,
+            max_new_tokens=128
+        )
 
-# ✅ Process and Store Dataset in ChromaDB (Parallelized)
-def process_dataset(dataset_name):
-    """Loads a dataset, embeds it, and stores in ChromaDB."""
-    print(f"Processing dataset: {dataset_name}")
+    embedding = outputs[0].cpu().numpy().tolist()
+    
+    # ✅ Print embedding size to confirm dimension
+    print(f"✅ Debug: Generated embedding dimension: {len(embedding)}")
+    
+    return embedding
 
-    try:
-        dataset = load_dataset(dataset_name, cache_dir="~/.cache/huggingface/datasets")
-        collection = chroma_client.get_or_create_collection(name=dataset_name.replace("/", "_"))
 
-        batch_size = 10  # Reduce batch size for lower RAM usage
-        texts = dataset["train"]["text"]
 
-        def process_batch(start_idx):
-            batch = texts[start_idx : start_idx + batch_size]
-            embeddings = [embed_text(text) for text in batch]
-            collection.add(
-                ids=[f"{dataset_name}_{i}" for i in range(start_idx, start_idx + len(batch))],
-                embeddings=embeddings,
-                metadatas=[{"source": dataset_name, "text": text} for text in batch]
-            )
-            print(f"✅ Stored batch {start_idx} - {start_idx + len(batch)} for {dataset_name}")
+# ✅ Process Dataset
+log("Embedding custom dataset into ChromaDB...")
+for i, text in enumerate(dataset):
+    embedding = embed_text(text)
+    collection.add(
+        ids=[f"example_{i}"],
+        embeddings=[embedding],
+        metadatas=[{"source": "custom", "text": text}]
+    )
+    if i % 10 == 0:
+        log(f"Processed {i}/{len(dataset)} examples...")
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            for i in range(0, len(texts), batch_size):
-                executor.submit(process_batch, i)
+log("Finished embedding dataset into ChromaDB!")
 
-    except Exception as e:
-        print(f"⚠️ Failed to process {dataset_name}: {e}")
-
-# ✅ Run Processing for All Datasets in Parallel
-for dataset in datasets_list:
-    process_dataset(dataset)
-
-# ==============================================
-# 🔎 **Step 2: Multi-Dataset RAG Query Retrieval**
-# ==============================================
+# ✅ Retrieval & Response Generation
 def retrieve_and_generate(query):
-    """Retrieve from ALL datasets, prioritizing 'sales-conversations', then generate a response."""
+    """Retrieve relevant texts and generate a response."""
     query_embedding = embed_text(query)
-    retrieved_texts = []
-
-    for dataset_name in datasets_list:
-        collection_name = dataset_name.replace("/", "_")
-        try:
-            collection = chroma_client.get_collection(name=collection_name)
-            results = collection.query(query_embeddings=[query_embedding], n_results=3)
-            
-            if dataset_name == "goendalf666/sales-conversations":
-                retrieved_texts.extend([item["text"] for item in results["metadatas"][0]] * 2)
-            else:
-                retrieved_texts.extend([item["text"] for item in results["metadatas"][0]])
-        except Exception as e:
-            print(f"⚠️ No data found for {dataset_name}: {e}")
-
+    results = collection.query(query_embeddings=[query_embedding], n_results=3)
+    
+    retrieved_texts = [item["text"] for item in results["metadatas"][0]]
+    
+    # ✅ Construct prompt with Bernardo's identity
+    persona = (
+        "You are Bernardo Guerra, Co-Founder of Native Materials in San Juan, PR. "
+        "You are a smooth but cunning salesman and entrepreneur. Your company imports and sells "
+        "construction materials in large quantities, so sales incur in large orders. No small order "
+        "will be taken unless multiple orders combined make a large order. You handle lead acquisition, "
+        "customer retention, order processing and fulfillment, sales, and CRM-related tasks. "
+        "The customer should never be able to tell the difference between you and Bernardo. "
+        "You are charismatic but to the point.\n\n"
+    )
+    
     context = " ".join(retrieved_texts[:5])
-    prompt = f"Context: {context}\n\nQuestion: {query}\nAnswer:"
-    inputs = tokenizer(prompt, return_tensors="pt").to("cpu")
-
+    prompt = f"{persona}Context: {context}\n\nCustomer: {query}\nBernardo:"
+    
+    inputs = tokenizer(
+        prompt, return_tensors="pt", padding=True, truncation=True, max_length=512
+    ).to("cpu")
+    
     with torch.no_grad():
-        output_ids = model.generate(inputs["input_ids"], max_length=500)
+        output_ids = model.generate(
+            inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            pad_token_id=tokenizer.eos_token_id,
+            max_length=500
+        )
     
     response = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     return response
 
 # ✅ Example Query
-query_text = "How should I handle a customer objection in sales?"
-response = retrieve_and_generate(query_text)
+test_query = "I need 50 bags of cement, what's the best price you can offer?"
+response = retrieve_and_generate(test_query)
+log("Generated response:")
 print("\n🧠 **DeepSeek-R1 7B Response:**", response)
