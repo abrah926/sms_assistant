@@ -2,6 +2,7 @@ import json
 import chromadb
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
+import time
 
 # ✅ Use DeepSeek-R1 7B
 MODEL_PATH = "/home/abraham/models/deepseek-7b"
@@ -17,38 +18,35 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 # ✅ Load model with CPU-Only Optimization
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_PATH,
-    torch_dtype=torch.float32,  # Prevents float16 CPU instability
-    device_map="cpu",  # Force CPU mode
-    low_cpu_mem_usage=True,  # Load layer-by-layer instead of full model in RAM
-    offload_folder="offload_dir"  # Moves unused layers to disk to free RAM
+    torch_dtype=torch.float32,
+    device_map="cpu",
+    low_cpu_mem_usage=True,
+    offload_folder="offload_dir"
 )
 
-model.eval()  # Set to evaluation mode
-log("DeepSeek-R1 7B is loaded on CPU with OPTIMIZED RAM USAGE!")
+model.eval()
+log("✅ DeepSeek-R1 7B is loaded on CPU with OPTIMIZED RAM USAGE!")
 
 # ✅ Load Custom Dataset
-DATASET_PATH = "DeepSeek_dataset.json"
-with open(DATASET_PATH, "r") as f:
-    dataset = json.load(f)
+custom_dataset_path = "DeepSeek_dataset.json"
 
-log(f"Loaded custom dataset from {DATASET_PATH}, containing {len(dataset)} examples.")
+with open(custom_dataset_path, "r") as f:
+    final_dataset = json.load(f)
+
+log(f"✅ Loaded custom dataset from {custom_dataset_path}, containing {len(final_dataset)} examples.")
 
 # ✅ Initialize ChromaDB (Persistent Storage)
-# ✅ Initialize ChromaDB (Ensure Persistent Storage)
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
-# ✅ Delete old collection to avoid mismatched dimensions
+# ✅ Reset Collection for Custom Dataset
 try:
     chroma_client.delete_collection(name="deepseek_custom")
-    print("✅ Old ChromaDB collection deleted.")
+    log("✅ Old ChromaDB collection deleted.")
 except Exception as e:
-    print(f"⚠️ Warning: {e}")
+    log(f"⚠️ Warning: {e}")
 
-# ✅ Recreate collection with correct dimension (465)
 collection = chroma_client.get_or_create_collection(name="deepseek_custom", metadata={"dim": 465})
-print("✅ ChromaDB collection reset with dimension 465")
-
-print(f"✅ ChromaDB collection created with dimension: {collection.metadata}")
+log("✅ ChromaDB collection recreated with dimension 465.")
 
 # ✅ Function to Embed Text
 def embed_text(text):
@@ -58,75 +56,40 @@ def embed_text(text):
     ).to("cpu", non_blocking=True)
 
     with torch.no_grad():
-        outputs = model.generate(
-            inputs["input_ids"],
+        outputs = model(
+            input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
-            pad_token_id=tokenizer.eos_token_id,
-            max_new_tokens=128
+            output_hidden_states=True,
+            return_dict=True
         )
 
-    embedding = outputs[0].cpu().numpy().tolist()
-    
-    # ✅ Print embedding size to confirm dimension
-    print(f"✅ Debug: Generated embedding dimension: {len(embedding)}")
-    
+    # ✅ Extract last hidden state (4096 dimensions)
+    embedding = outputs.hidden_states[-1].mean(dim=1).squeeze().cpu().numpy()
+
+    # ✅ Ensure embeddings are always 465-dimensional
+    if len(embedding) > 465:
+        embedding = embedding[:465]  # Trim excess dimensions
+    elif len(embedding) < 465:
+        embedding = list(embedding) + [0] * (465 - len(embedding))  # Pad with zeros
+
     return embedding
 
+# ✅ Embed & Store in ChromaDB
+log("🚀 Starting embedding process for custom dataset...")
 
+start_time = time.time()
 
-# ✅ Process Dataset
-log("Embedding custom dataset into ChromaDB...")
-for i, text in enumerate(dataset):
+for i, text in enumerate(final_dataset):
     embedding = embed_text(text)
     collection.add(
         ids=[f"example_{i}"],
         embeddings=[embedding],
-        metadatas=[{"source": "custom", "text": text}]
+        metadatas=[{"source": "custom_dataset", "text": text}]
     )
-    if i % 10 == 0:
-        log(f"Processed {i}/{len(dataset)} examples...")
 
-log("Finished embedding dataset into ChromaDB!")
+    if i % 50 == 0:
+        elapsed_time = time.time() - start_time
+        log(f"✅ Processed {i}/{len(final_dataset)} examples in {elapsed_time:.2f}s...")
 
-# ✅ Retrieval & Response Generation
-def retrieve_and_generate(query):
-    """Retrieve relevant texts and generate a response."""
-    query_embedding = embed_text(query)
-    results = collection.query(query_embeddings=[query_embedding], n_results=3)
-    
-    retrieved_texts = [item["text"] for item in results["metadatas"][0]]
-    
-    # ✅ Construct prompt with Bernardo's identity
-    persona = (
-        "You are Bernardo Guerra, Co-Founder of Native Materials in San Juan, PR. "
-        "You are a smooth but cunning salesman and entrepreneur. Your company imports and sells "
-        "construction materials in large quantities, so sales incur in large orders. No small order "
-        "will be taken unless multiple orders combined make a large order. You handle lead acquisition, "
-        "customer retention, order processing and fulfillment, sales, and CRM-related tasks. "
-        "The customer should never be able to tell the difference between you and Bernardo. "
-        "You are charismatic but to the point.\n\n"
-    )
-    
-    context = " ".join(retrieved_texts[:5])
-    prompt = f"{persona}Context: {context}\n\nCustomer: {query}\nBernardo:"
-    
-    inputs = tokenizer(
-        prompt, return_tensors="pt", padding=True, truncation=True, max_length=512
-    ).to("cpu")
-    
-    with torch.no_grad():
-        output_ids = model.generate(
-            inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            pad_token_id=tokenizer.eos_token_id,
-            max_length=500
-        )
-    
-    response = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    return response
-
-# ✅ Example Query
-test_query = "I need 50 bags of cement, what's the best price you can offer?"
-response = retrieve_and_generate(test_query)
-log("Generated response:")
-print("\n🧠 **DeepSeek-R1 7B Response:**", response)
+total_elapsed_time = time.time() - start_time
+log(f"✅ ✅ Finished embedding custom dataset in {total_elapsed_time:.2f}s! 🎉")
