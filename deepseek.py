@@ -37,15 +37,17 @@ log(f"Loaded custom dataset from {DATASET_PATH}, containing {len(dataset)} examp
 # ✅ Initialize ChromaDB (Ensure Persistent Storage)
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
-# ✅ Force Delete Old Collection to Reset Dimension
+# ✅ Delete old collection to avoid mismatched dimensions
 try:
-    chroma_client.delete_collection(name="deepseek_custom")  # Ensure old collection is removed
+    chroma_client.delete_collection(name="deepseek_custom")
     print("✅ Old ChromaDB collection deleted.")
 except Exception as e:
     print(f"⚠️ Warning: {e}")
 
-# ✅ Recreate Collection with Correct Dimension (485)
-collection = chroma_client.get_or_create_collection(name="deepseek_custom", metadata={"dim": 485})
+# ✅ Recreate collection with correct dimension (465)
+collection = chroma_client.get_or_create_collection(name="deepseek_custom", metadata={"dim": 465})
+print("✅ ChromaDB collection reset with dimension 465")
+
 print(f"✅ ChromaDB collection created with dimension: {collection.metadata}")
 
 # ✅ Function to Embed Text
